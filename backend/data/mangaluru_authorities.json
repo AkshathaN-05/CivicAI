@@ -1,0 +1,67 @@
+{
+  "authorities": [
+    {
+      "id": "auth-001",
+      "name": "Mangaluru City Corporation (MCC)",
+      "short_name": "MCC",
+      "categories": ["pothole", "road_damage", "garbage_overflow", "broken_streetlight", "illegal_construction", "open_drain", "other"],
+      "area_text": "Mangaluru city limits, Kadri, Hampankatta, Lalbagh, Balmatta, Kodialbail, Urwa, Kankanady, Attavar, Bejai, Bunts Hostel, Bikarnakatte",
+      "contact_email": "commissioner@mangalurumahanagara.in",
+      "phone": "0824-2220055"
+    },
+    {
+      "id": "auth-002",
+      "name": "Mangaluru City Corporation — North Zone",
+      "short_name": "MCC North",
+      "categories": ["pothole", "road_damage", "garbage_overflow", "broken_streetlight"],
+      "area_text": "Derebail, Kuloor, Nanthoor, Bondel, Kavoor, Kulayi, Katipalla, Surathkal",
+      "contact_email": "northzone@mangalurumahanagara.in",
+      "phone": "0824-2220066"
+    },
+    {
+      "id": "auth-003",
+      "name": "Mangaluru Water Works Department",
+      "short_name": "MWWD",
+      "categories": ["water_supply", "sewage"],
+      "area_text": "Mangaluru city, Kuloor, Derebail, Bondel, Kadri, Attavar, Kankanady, Bejai, Urwa, Hampankatta",
+      "contact_email": "waterworks@mangalurumahanagara.in",
+      "phone": "0824-2424444"
+    },
+    {
+      "id": "auth-004",
+      "name": "National Highways Authority of India — Mangaluru",
+      "short_name": "NHAI Mangaluru",
+      "categories": ["pothole", "road_damage"],
+      "area_text": "NH 75, NH 66, Pumpwell Circle, Bunts Hostel junction, Padil, Vamanjoor, Thokkottu, Surathkal, Bajpe",
+      "contact_email": "mangaluru@nhai.org",
+      "phone": "0824-2452001"
+    },
+    {
+      "id": "auth-005",
+      "name": "MESCOM (Electricity Supply Company)",
+      "short_name": "MESCOM",
+      "categories": ["broken_streetlight"],
+      "area_text": "Mangaluru, Kadri, Hampankatta, Kodialbail, Bikarnakatte, Surathkal, Kuloor, Derebail, Bondel, Kankanady, Bejai",
+      "contact_email": "mangaluru@mescom.in",
+      "phone": "1912"
+    },
+    {
+      "id": "auth-006",
+      "name": "Mangaluru Urban Development Authority (MUDA)",
+      "short_name": "MUDA",
+      "categories": ["illegal_construction", "other"],
+      "area_text": "Mangaluru urban agglomeration, Derebail, Kuloor, Nanthoor, Kavoor, Bikarnakatte, Vamanjoor, Mulky, Moodbidri",
+      "contact_email": "commissioner@muda.gov.in",
+      "phone": "0824-2454321"
+    },
+    {
+      "id": "auth-007",
+      "name": "MCC Drainage Division",
+      "short_name": "MCC Drainage",
+      "categories": ["waterlogging", "open_drain", "sewage"],
+      "area_text": "Mangaluru city, Hampankatta, Balmatta, Kadri, Kodialbail, Bejai, Urwa, Kavoor, Derebail, Kankanady",
+      "contact_email": "drainage@mangalurumahanagara.in",
+      "phone": "0824-2220077"
+    }
+  ]
+}
