@@ -4,6 +4,11 @@
 fastapi==0.111.1
 uvicorn[standard]==0.30.6
 slowapi==0.1.9
+# httpx pinned to 0.27.2 for supabase 2.7.4 compatibility (requires httpx<0.28).
+# NOTE: ultralytics-platform (a sub-dependency of ultralytics) declares httpx>=0.28;
+# this is a soft conflict — ultralytics-platform is the cloud SDK only and is not
+# used by any T2-x CV tasks.  The pin keeps supabase functional on the Render backend.
+# When supabase is upgraded to a version requiring httpx>=0.28 this pin can be removed.
 httpx==0.27.2
 Pillow==10.4.0
 blake3==1.0.9
@@ -11,3 +16,11 @@ python-multipart==0.0.9
 pydantic-settings==2.4.0
 supabase==2.7.4
 python-jose[cryptography]==3.3.0
+
+# Phase 2 — AI/CV dependencies (T2-1)
+ultralytics
+opencv-python-headless
+fast-alpr
+sentence-transformers
+groq
+psutil

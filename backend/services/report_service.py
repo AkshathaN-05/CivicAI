@@ -6,8 +6,8 @@ All business logic stays here; route handlers remain thin (Part A §6).
 
 Persistence strategy:
   1. Always build the ReportOut object and write it to _STORE (in-memory).
-  2. If Supabase is fully configured (URL + SERVICE_KEY + DEMO_USER_ID), also
-     persist to the public.reports table via report_repo.
+  2. If Supabase is fully configured (URL + SERVICE_KEY), also persist to the
+     public.reports table via report_repo, using the authenticated user_id.
   3. On any Supabase error, the in-memory entry is already present so the
      response is unaffected.
 
@@ -16,6 +16,13 @@ Read strategy:
   2. Fall back to _STORE if Supabase is unconfigured or the row is not found.
   This means data written to Supabase is visible even after a process restart,
   while the app degrades gracefully to in-memory when Supabase is unavailable.
+
+T3-3 security notes:
+  - create_report() accepts an optional user_id from the authenticated JWT sub.
+  - DEMO_USER_ID is used as fallback only when user_id is not provided (local dev
+    without auth enabled, or in-memory-only mode).
+  - _supabase_enabled() no longer requires DEMO_USER_ID; URL + SERVICE_KEY suffice.
+  - get_report_with_owner() returns (ReportOut, owner_user_id) for IDOR checks.
 """
 from __future__ import annotations
 
@@ -43,17 +50,24 @@ logger = logging.getLogger(__name__)
 
 _STORE: dict[str, ReportOut] = {}
 
+# Maps report_id → owner user_id for IDOR checks on the in-memory fallback.
+_OWNER_STORE: dict[str, str] = {}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def _supabase_enabled() -> bool:
-    """True only when all three required settings are non-empty."""
+    """True when Supabase URL and service key are configured.
+
+    DEMO_USER_ID is no longer required here — T3-3 supplies the authenticated
+    user_id at call time.  DEMO_USER_ID is only used as a fallback inside
+    create_report() when no authenticated user_id is provided (local dev).
+    """
     return bool(
         settings.SUPABASE_URL
         and settings.SUPABASE_SERVICE_KEY
-        and settings.DEMO_USER_ID
     )
 
 
@@ -124,7 +138,17 @@ def _row_to_report_out(row: dict) -> Optional[ReportOut]:
 def create_report(
     payload: ReportCreate,
     photo_filename: Optional[str] = None,
+    user_id: Optional[str] = None,
 ) -> ReportOut:
+    """Create a new report.
+
+    Args:
+        payload:        Validated ReportCreate with category, area_text, description.
+        photo_filename: Optional filename of the uploaded photo.
+        user_id:        Authenticated user's JWT sub.  When provided, used as the
+                        Supabase row owner.  Falls back to DEMO_USER_ID for local dev
+                        when Supabase is configured but no JWT was supplied.
+    """
     # Authority routing always uses the immutable JSON (ADR-001 — unchanged).
     authority, reason, confidence = route_to_authority(
         payload.category.value,
@@ -152,14 +176,29 @@ def create_report(
     # available regardless of Supabase outcome.
     _STORE[report.report_id] = report
 
+    # Track the owner for IDOR checks on the in-memory fallback (T3-3).
+    if user_id:
+        _OWNER_STORE[report.report_id] = user_id
+
     # Attempt Supabase persistence when fully configured.
     if _supabase_enabled():
         try:
             from db.repositories import report_repo
 
+            # Prefer the authenticated user_id; fall back to DEMO_USER_ID for
+            # local dev without a JWT (preserves the in-memory fallback path).
+            effective_user_id = user_id or settings.DEMO_USER_ID
+            if not effective_user_id:
+                # No user_id and no DEMO_USER_ID — skip Supabase insert since
+                # reports.user_id is NOT NULL.
+                logger.debug(
+                    "create_report: no user_id available; skipping Supabase insert."
+                )
+                return report
+
             row = {
                 "id": report_id,
-                "user_id": settings.DEMO_USER_ID,
+                "user_id": effective_user_id,
                 "ai_category": payload.category.value,
                 "address_text": payload.area_text,
                 "ai_confidence": confidence,
@@ -203,6 +242,44 @@ def get_report(report_id: str) -> Optional[ReportOut]:
             )
 
     return _STORE.get(report_id)
+
+
+def get_report_with_owner(report_id: str) -> Optional[tuple[ReportOut, str]]:
+    """Return (ReportOut, owner_user_id) for IDOR checks (T3-3).
+
+    Tries Supabase first (which stores the user_id column directly), then
+    falls back to the in-memory _STORE + _OWNER_STORE.
+
+    Returns:
+        (report, owner_user_id) if found and owner is known.
+        None if the report does not exist.
+        (report, "") if the report exists but owner is unknown (in-memory
+        reports created before T3-3 auth, e.g. legacy in-memory data) —
+        callers should treat an empty owner string as unprotected / skip
+        IDOR check.
+    """
+    # Try Supabase first — the DB row includes user_id.
+    if _supabase_enabled():
+        try:
+            from db.repositories import report_repo
+
+            row = report_repo.get_report_by_id(report_id)
+            if row:
+                report = _row_to_report_out(row)
+                if report:
+                    return report, row.get("user_id", "")
+        except Exception:
+            logger.warning(
+                "get_report_with_owner: Supabase query failed — falling back to in-memory.",
+                exc_info=True,
+            )
+
+    # In-memory fallback.
+    report = _STORE.get(report_id)
+    if report is None:
+        return None
+    owner = _OWNER_STORE.get(report_id, "")
+    return report, owner
 
 
 def list_reports() -> list[ReportOut]:
