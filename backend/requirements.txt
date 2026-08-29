@@ -20,7 +20,14 @@ python-jose[cryptography]==3.3.0
 # Phase 2 — AI/CV dependencies (T2-1)
 ultralytics
 opencv-python-headless
+# onnxruntime required by open-image-models (T2-4 licence-plate detector).
+# open-image-models uses onnxruntime for ONNX inference; without it
+# create_detector is unavailable and the plate-redaction tests fail.
+onnxruntime
 fast-alpr
+open-image-models
 sentence-transformers
 groq
 psutil
+# tiktoken — token counting for chunker.py (T2-13); architecture Part B §Chunking Strategy
+tiktoken

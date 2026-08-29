@@ -40,3 +40,22 @@ export function confidenceLabel(c: number): string {
   if (c >= 0.6) return "Medium";
   return "Low";
 }
+
+export interface AuthorityOption {
+  id: string;
+  name: string;
+  short_name: string;
+}
+
+// Immutable authority list — mirrors backend/data/mangaluru_authorities.json (ADR-001).
+// Hardcoded per discovery: the backend has no GET /authorities/ endpoint and the
+// data is explicitly declared immutable.
+export const MANGALURU_AUTHORITIES: AuthorityOption[] = [
+  { id: "auth-001", name: "Mangaluru City Corporation (MCC)", short_name: "MCC" },
+  { id: "auth-002", name: "Mangaluru City Corporation — North Zone", short_name: "MCC North" },
+  { id: "auth-003", name: "Mangaluru Water Works Department", short_name: "MWWD" },
+  { id: "auth-004", name: "National Highways Authority of India — Mangaluru", short_name: "NHAI Mangaluru" },
+  { id: "auth-005", name: "MESCOM (Electricity Supply Company)", short_name: "MESCOM" },
+  { id: "auth-006", name: "Mangaluru Urban Development Authority (MUDA)", short_name: "MUDA" },
+  { id: "auth-007", name: "MCC Drainage Division", short_name: "MCC Drainage" },
+];
