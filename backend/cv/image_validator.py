@@ -34,8 +34,15 @@ ALLOWED_MIME_TYPES: frozenset[str] = frozenset(
 #: Maximum accepted file size: 10 MB.
 MAX_FILE_SIZE_BYTES: int = 10 * 1024 * 1024  # 10 MB
 
-#: Minimum image dimension on both axes.
-MIN_DIMENSION_PX: int = 200  # 200×200 px
+#: Minimum area in pixels (width × height).
+#: Rejects only genuinely unusable images (e.g. 1×1, 10×5) while accepting
+#: normal portrait (180×344), landscape (344×180), and square images of any
+#: reasonable real-world aspect ratio.
+MIN_AREA_PX: int = 10_000  # ~100×100 equivalent area
+
+#: Minimum shortest-side dimension.
+#: Prevents single-row/column degenerate images (e.g. 50000×1).
+MIN_SHORT_SIDE_PX: int = 50
 
 #: Max longest-side dimension after resize (for CV inference memory).
 MAX_SIDE_PX: int = 1024
@@ -82,7 +89,10 @@ def validate_image(
                           provided; the magic-bytes check is always authoritative).
     3. Magic-bytes check — reject bytes that don't match a known image header.
     4. Pillow open       — reject files Pillow cannot decode (corrupted, truncated).
-    5. Dimensions check  — reject images smaller than MIN_DIMENSION_PX × MIN_DIMENSION_PX.
+    5. Dimensions check  — reject images with area < MIN_AREA_PX or shortest
+                           side < MIN_SHORT_SIDE_PX.  Portrait, landscape, and
+                           square images all pass as long as the image has
+                           sufficient total pixels and is not degenerate.
     6. Resize            — scale down to MAX_SIDE_PX longest side (LANCZOS).
     7. Re-encode         — save as JPEG quality=85, strips EXIF / metadata.
 
@@ -136,11 +146,18 @@ def validate_image(
         ) from exc
 
     # 5. Minimum dimensions check.
+    # Accepts portrait, landscape, and square images as long as the total area
+    # and the shortest side are above the minimum thresholds.  This replaces
+    # the previous both-axes-200 rule which incorrectly rejected valid civic
+    # images such as 344×180 px.
     width, height = img.size
-    if width < MIN_DIMENSION_PX or height < MIN_DIMENSION_PX:
+    area = width * height
+    short_side = min(width, height)
+    if area < MIN_AREA_PX or short_side < MIN_SHORT_SIDE_PX:
         raise ImageValidationError(
-            f"Image too small: {width}×{height} px. "
-            f"Minimum required: {MIN_DIMENSION_PX}×{MIN_DIMENSION_PX} px."
+            f"Image too small: {width}×{height} px "
+            f"(area={area} px², shortest side={short_side} px). "
+            f"Minimum: {MIN_AREA_PX} total pixels and {MIN_SHORT_SIDE_PX} px shortest side."
         )
 
     # 6. Resize to max 1024px longest side (in-place thumbnail).

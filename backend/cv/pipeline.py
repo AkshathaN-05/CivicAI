@@ -252,7 +252,23 @@ async def run_ai_pipeline(
             "pipeline: step 5-6 (YOLO+taxonomy) — class='%s' conf=%.3f → %s",
             yolo_class, raw_detection_confidence, category.value,
         )
+
+        # -----------------------------------------------------------------------
+        # Step 5b: Civic-relevance gate
+        # Raises ImageValidationError for personal/portrait photos that contain
+        # no civic-infrastructure evidence.  Valid civic scenes containing people
+        # (e.g. a road with pedestrians) pass through unchanged.
+        # ImageValidationError propagates to the caller exactly like a T2-2
+        # validation failure — the report is not created.
+        # -----------------------------------------------------------------------
+        from cv.relevance import check_civic_relevance
+        check_civic_relevance(detection)
+
     except Exception as exc:
+        # Re-raise ImageValidationError so the router returns HTTP 422.
+        from cv.image_validator import ImageValidationError as _IVE
+        if isinstance(exc, _IVE):
+            raise
         logger.warning(
             "pipeline: steps 5-6 (YOLO) failed — defaulting to category=other: %s", exc
         )

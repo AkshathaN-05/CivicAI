@@ -56,16 +56,21 @@ class DetectionResult:
     """Top-1 YOLO detection with taxonomy-mapped civic category.
 
     Attributes:
-        yolo_class:  COCO class name of the top detection (empty string if none).
-        confidence:  Raw YOLOv8n confidence score for the top detection [0.0, 1.0].
-                     0.0 when no objects are detected.
-        category:    CivicAI IssueCategory mapped from ``yolo_class`` by the
-                     taxonomy module.  Always IssueCategory.other when no
-                     detection is made.
+        yolo_class:      COCO class name of the top detection (empty string if none).
+        confidence:      Raw YOLOv8n confidence score for the top detection [0.0, 1.0].
+                         0.0 when no objects are detected.
+        category:        CivicAI IssueCategory mapped from ``yolo_class`` by the
+                         taxonomy module.  Always IssueCategory.other when no
+                         detection is made.
+        all_class_names: Tuple of all detected COCO class names (may include
+                         duplicates when the same class appears multiple times).
+                         Empty tuple when no objects are detected.
+                         Used by the civic-relevance gate (cv/relevance.py).
     """
     yolo_class: str
     confidence: float
     category: IssueCategory
+    all_class_names: tuple = ()  # tuple[str, ...] — empty when no detections
 
 
 # ---------------------------------------------------------------------------
@@ -132,13 +137,20 @@ def detect_civic_issue(image: Image.Image) -> DetectionResult:
 
     if boxes is None or len(boxes) == 0:
         logger.debug("detect_civic_issue: no objects detected.")
-        return DetectionResult(yolo_class="", confidence=0.0, category=IssueCategory.other)
+        return DetectionResult(
+            yolo_class="", confidence=0.0, category=IssueCategory.other, all_class_names=()
+        )
 
     # Extract confidence scores and class indices as Python lists.
     # boxes.conf is a tensor of shape (N,); boxes.cls is a tensor of shape (N,).
     confidences = boxes.conf.tolist()  # [float, ...]
     class_ids = boxes.cls.tolist()     # [float, ...]  (float because tensor dtype)
     names: dict[int, str] = frame_result.names  # {int: str} COCO class names
+
+    # Build the full list of detected class names (used by relevance gate).
+    all_class_names: tuple = tuple(
+        names.get(int(cid), "") for cid in class_ids
+    )
 
     # Select top-1 by highest confidence.
     best_idx = int(max(range(len(confidences)), key=lambda i: confidences[i]))
@@ -149,13 +161,15 @@ def detect_civic_issue(image: Image.Image) -> DetectionResult:
     category = map_to_category(best_class_name)
 
     logger.debug(
-        "detect_civic_issue: top-1 '%s' (id=%d) conf=%.3f → %s",
+        "detect_civic_issue: top-1 '%s' (id=%d) conf=%.3f → %s; all=%s",
         best_class_name, best_class_id, best_conf, category.value,
+        all_class_names,
     )
     return DetectionResult(
         yolo_class=best_class_name,
         confidence=best_conf,
         category=category,
+        all_class_names=all_class_names,
     )
 
 

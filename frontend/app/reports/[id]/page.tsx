@@ -126,16 +126,38 @@ export default function ReportDetailPage() {
         </div>
       )}
 
+      {/* Evidence image — privacy-redacted version only (image_redacted_url).
+          The original unredacted URL is never shown here. If the signed URL is
+          unavailable the section is silently omitted. */}
+      {report.image_redacted_url && (
+        <div className="border border-border rounded-xl bg-card overflow-hidden mb-4">
+          <div className="px-5 pt-4 pb-2">
+            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide flex items-center gap-1.5">
+              <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M2.036 12.322a1.012 1.012 0 0 1 0-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.963-7.178Z" />
+                <path strokeLinecap="round" strokeLinejoin="round" d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z" />
+              </svg>
+              Evidence Photo (privacy-redacted)
+            </p>
+          </div>
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            src={report.image_redacted_url}
+            alt={`Evidence photo for ${report.category_label} report`}
+            className="w-full max-h-80 object-contain bg-black/5 px-4 pb-4"
+            onError={(e) => {
+              // Signed URL expired or unavailable — hide the broken image gracefully.
+              (e.currentTarget as HTMLImageElement).style.display = "none";
+            }}
+          />
+        </div>
+      )}
+
       {/* Detail rows */}
       <div className="border border-border rounded-xl bg-card divide-y divide-border mb-4">
         <DetailRow label="Description">{report.description || <span className="text-muted-foreground italic">No description</span>}</DetailRow>
         <DetailRow label="Status"><StatusBadge status={report.status} /></DetailRow>
         <DetailRow label="Submitted">{formatDate(report.created_at)}</DetailRow>
-        {report.photo_filename && (
-          <DetailRow label="Photo">
-            <span className="font-mono text-xs bg-accent px-2 py-0.5 rounded">{report.photo_filename}</span>
-          </DetailRow>
-        )}
       </div>
 
       {/* Authority card */}

@@ -114,9 +114,15 @@ def fallback_complaint_description(
         A valid :class:`~llm.output_validator.LLMOutput` instance.
     """
     cat_label = _label(category)
+    # Only include the detected object name when the taxonomy produced a
+    # meaningful civic category from it.  When category is "other" the YOLO
+    # class (e.g. "frisbee") is a spurious COCO detection unrelated to the
+    # actual civic issue — including it in the citizen-facing description is
+    # confusing and misleading.
+    _meaningful_category = category != "other"
     obj_suffix = (
         f" Detected objects in the image: {detected_objects}."
-        if detected_objects
+        if detected_objects and _meaningful_category
         else ""
     )
     # Build description (max 500 chars — kept well under that by template).
@@ -216,23 +222,28 @@ def fallback_classify_category(
     detected_objects: str,
     address: str,
 ) -> LLMOutput:
-    """Classify civic category from detected objects (deterministic, no API).
+    """Classify civic category from detected objects and address (deterministic, no API).
 
-    Applies simple keyword matching against the detected objects string to
-    select the most likely IssueCategory.  Falls back to ``other`` when no
-    match is found.
+    First applies keyword matching against the detected objects string.
+    If no match is found (e.g. YOLO returned a low-confidence irrelevant class
+    like "frisbee" for a pothole image), falls back to scanning the address
+    string for civic-issue keywords.  This second pass significantly improves
+    accuracy when YOLO cannot identify a known civic object but the address
+    text contains descriptive context (e.g. "pothole near MG Road").
 
     Args:
         detected_objects: Comma-separated string of YOLO-detected class names.
-        address:          Free-text location description (used in description).
+        address:          Free-text location description (used in description
+                          and as a secondary classification signal).
 
     Returns:
         A valid :class:`~llm.output_validator.LLMOutput` instance.
     """
     obj_lower = detected_objects.lower()
+    addr_lower = address.lower()
 
-    # Keyword → category mapping (order matters; first match wins).
-    _KEYWORD_MAP: list[tuple[str, IssueCategory]] = [
+    # Keyword → category mapping for detected objects (order matters; first match wins).
+    _OBJ_KEYWORD_MAP: list[tuple[str, IssueCategory]] = [
         ("pothole",             IssueCategory.pothole),
         ("bottle",              IssueCategory.garbage_overflow),
         ("cup",                 IssueCategory.garbage_overflow),
@@ -240,12 +251,10 @@ def fallback_classify_category(
         ("food",                IssueCategory.garbage_overflow),
         ("trash",               IssueCategory.garbage_overflow),
         ("garbage",             IssueCategory.garbage_overflow),
-        ("backpack",            IssueCategory.garbage_overflow),
         ("suitcase",            IssueCategory.garbage_overflow),
         ("toilet",              IssueCategory.sewage),
         ("sink",                IssueCategory.water_supply),
         ("boat",                IssueCategory.waterlogging),
-        ("umbrella",            IssueCategory.waterlogging),
         ("traffic light",       IssueCategory.broken_streetlight),
         ("fire hydrant",        IssueCategory.broken_streetlight),
         ("car",                 IssueCategory.road_damage),
@@ -256,11 +265,49 @@ def fallback_classify_category(
         ("stop sign",           IssueCategory.road_damage),
     ]
 
+    # Address-context keyword → category mapping.
+    # Used as a fallback when YOLO detects nothing useful (e.g. low-confidence
+    # generic class like "frisbee" returned for a pothole image).
+    # The address the citizen typed often contains the issue description.
+    _ADDR_KEYWORD_MAP: list[tuple[str, IssueCategory]] = [
+        ("pothole",             IssueCategory.pothole),
+        ("pot hole",            IssueCategory.pothole),
+        ("waterlog",            IssueCategory.waterlogging),
+        ("flood",               IssueCategory.waterlogging),
+        ("drain",               IssueCategory.open_drain),
+        ("sewage",              IssueCategory.sewage),
+        ("sewer",               IssueCategory.sewage),
+        ("streetlight",         IssueCategory.broken_streetlight),
+        ("street light",        IssueCategory.broken_streetlight),
+        ("lamp",                IssueCategory.broken_streetlight),
+        ("garbage",             IssueCategory.garbage_overflow),
+        ("waste",               IssueCategory.garbage_overflow),
+        ("litter",              IssueCategory.garbage_overflow),
+        ("water supply",        IssueCategory.water_supply),
+        ("water pipe",          IssueCategory.water_supply),
+        ("road damage",         IssueCategory.road_damage),
+        ("road",                IssueCategory.road_damage),
+        ("construction",        IssueCategory.illegal_construction),
+        ("encroachment",        IssueCategory.illegal_construction),
+    ]
+
     matched_category = IssueCategory.other
-    for keyword, cat in _KEYWORD_MAP:
+    match_source = "none"
+
+    # Pass 1: match against detected objects.
+    for keyword, cat in _OBJ_KEYWORD_MAP:
         if keyword in obj_lower:
             matched_category = cat
+            match_source = "objects"
             break
+
+    # Pass 2: if no object match, scan the address for civic keywords.
+    if matched_category is IssueCategory.other:
+        for keyword, cat in _ADDR_KEYWORD_MAP:
+            if keyword in addr_lower:
+                matched_category = cat
+                match_source = "address"
+                break
 
     cat_value = matched_category.value
     description = (
@@ -269,8 +316,8 @@ def fallback_classify_category(
     )[:500]
 
     logger.debug(
-        "fallback_classify_category: objects=%r → category=%s",
-        detected_objects, cat_value,
+        "fallback_classify_category: objects=%r address=%r → category=%s (source=%s)",
+        detected_objects, address, cat_value, match_source,
     )
     return LLMOutput(
         category=matched_category,

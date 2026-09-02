@@ -8,7 +8,7 @@ T2-3: `redact_faces(image: PIL.Image) -> PIL.Image`
 T2-4: `redact_plates(image: PIL.Image) -> PIL.Image`
     Uses open-image-models YOLOv9 licence-plate detector (via fast-alpr) with
     lazy loading.  Applies a solid black rectangle over each detected plate
-    bounding box (ImageDraw.rectangle, fill=(0,0,0)).  Returns original image
+    bounding box (Gaussian blur, radius=20).  Returns original image
     unchanged when no plates detected.
 
 Combined pipeline helper:
@@ -38,7 +38,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageFilter
 
 logger = logging.getLogger(__name__)
 
@@ -241,15 +241,13 @@ def _get_plate_detector():
 
 
 def redact_plates(image: Image.Image) -> Image.Image:
-    """Detect all licence plates and apply a solid black rectangle over each.
-
-    Per T2-4 spec and Part A §14: ImageDraw.rectangle(bbox, fill=(0,0,0)).
+    """Detect all licence plates and apply Gaussian blur to each bounding box.
 
     Args:
         image: A PIL Image (any mode; converted to RGB for detection).
 
     Returns:
-        A new PIL Image with detected plate regions blacked out.
+        A new PIL Image with detected plate regions blurred (radius=20).
         If no plates are detected the original *image* object is returned
         unchanged.
 
@@ -278,13 +276,12 @@ def redact_plates(image: Image.Image) -> Image.Image:
         return image
 
     logger.debug(
-        "redact_plates: %d plate(s) detected — applying black rectangle.",
+        "redact_plates: %d plate(s) detected — applying Gaussian blur.",
         len(detections),
     )
 
     # Work on a copy so the input is not mutated.
     output = img_rgb.copy()
-    draw = ImageDraw.Draw(output)
 
     for det in detections:
         bbox = det.bounding_box  # BoundingBox(x1, y1, x2, y2)
@@ -299,8 +296,10 @@ def redact_plates(image: Image.Image) -> Image.Image:
             # Degenerate bounding box — skip.
             continue
 
-        # Apply solid black rectangle over plate (Part A §14, T2-4 spec).
-        draw.rectangle((x1, y1, x2, y2), fill=(0, 0, 0))
+        # Crop the plate region, blur it, paste back.
+        plate_crop = output.crop((x1, y1, x2, y2))
+        blurred_crop = plate_crop.filter(ImageFilter.GaussianBlur(radius=20))
+        output.paste(blurred_crop, (x1, y1))
 
     return output
 
@@ -329,7 +328,7 @@ def redact_privacy(image: Image.Image) -> Image.Image:
 
     Returns:
         PIL Image with all detected faces blurred and all detected plates
-        blacked out.
+        blurred.
     """
     img = redact_faces(image)
     img = redact_plates(img)

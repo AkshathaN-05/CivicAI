@@ -411,11 +411,26 @@ export default function NewReportPage() {
     setSubmittingCapture(false);
 
     if (error || !data) {
+      // apiFetch extracts the backend `detail` string from the JSON body and
+      // returns it as `error`.  For image-validation failures (wrong size,
+      // unsupported format, corrupt file) the backend sends the exact
+      // ImageValidationError message — show it directly so the citizen sees
+      // what the problem is.  For AI-pipeline 422s (image valid but
+      // unclassifiable) and any other non-HTTP errors, use a generic message.
+      const isImageValidationError =
+        typeof error === "string" &&
+        (error.includes("too small") ||
+          error.includes("too large") ||
+          error.includes("MIME type") ||
+          error.includes("image format") ||
+          error.includes("could not be decoded"));
       setCaptureError(
-        error === "HTTP 422"
-          ? "This photo could not be analysed. It may be unclear or not a civic issue. Please try a different photo."
+        isImageValidationError
+          ? error
           : error === "HTTP 429"
           ? "Too many requests. Please wait a moment and try again."
+          : error === "HTTP 422" || (typeof error === "string" && !error.startsWith("HTTP"))
+          ? "This photo could not be analysed. It may be unclear or not a civic issue. Please try a different photo."
           : error ?? "Could not process the image. Please try again."
       );
       return;

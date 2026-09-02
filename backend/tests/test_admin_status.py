@@ -121,6 +121,20 @@ def _patch_jwks():
             yield
 
 
+@pytest.fixture(autouse=True)
+def _disable_supabase():
+    """Force Supabase to appear unconfigured for all in-memory tests.
+
+    These tests seed reports into the in-memory _STORE.  Real Supabase
+    credentials may be present in the environment (.env file), which would
+    cause service functions to attempt live DB calls against a Supabase
+    instance that does not contain the test UUIDs.  Patching _supabase_enabled
+    to return False ensures the in-memory path is exercised exclusively.
+    """
+    with patch("services.report_service._supabase_enabled", return_value=False):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Helpers: seed an in-memory report at a given status
 # ---------------------------------------------------------------------------

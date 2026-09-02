@@ -56,8 +56,13 @@ def _make_jpeg_bytes(width: int = 300, height: int = 300, color="gray") -> bytes
 
 
 def _make_tiny_jpeg() -> bytes:
-    """Create a JPEG that is too small (< 200×200 px) — for invalid-input tests."""
-    img = Image.new("RGB", (100, 100), color="red")
+    """Create a JPEG that is too small to pass validation — for invalid-input tests.
+
+    Under the updated rule an image is rejected when:
+      area < MIN_AREA_PX (10_000)  OR  shortest side < MIN_SHORT_SIDE_PX (50).
+    A 40×40 px image has area=1600 and short_side=40 — fails both thresholds.
+    """
+    img = Image.new("RGB", (40, 40), color="red")
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=85)
     return buf.getvalue()

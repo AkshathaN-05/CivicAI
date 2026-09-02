@@ -35,6 +35,12 @@ async def lifespan(app: FastAPI):
             "JWT verification will attempt a live fetch on the first request. "
             "Check SUPABASE_URL and outbound HTTPS connectivity."
         )
+
+    # Validate that migration 007 has been applied (reports.status column).
+    # Logs a clear WARNING if not — does not block startup.
+    from db.schema_validator import validate_reports_schema
+    validate_reports_schema()
+
     yield
     # No teardown required.
 

@@ -589,6 +589,7 @@ export default function AdminPage() {
             <thead>
               <tr className="bg-[hsl(217,33%,98%)] border-b border-border">
                 <th className="text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide px-4 py-3">Category</th>
+                <th className="text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide px-4 py-3 hidden xl:table-cell">Evidence</th>
                 <th className="text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide px-4 py-3 hidden sm:table-cell">Location</th>
                 <th className="text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide px-4 py-3 hidden md:table-cell">Authority</th>
                 <th className="text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide px-4 py-3">Status</th>
@@ -613,6 +614,25 @@ export default function AdminPage() {
                         </Link>
                       </div>
                     </div>
+                  </td>
+                  {/* Evidence thumbnail — privacy-redacted image only.
+                      Original unredacted URL is never used here.
+                      Gracefully hidden if signed URL is absent or expired. */}
+                  <td className="px-4 py-3 hidden xl:table-cell">
+                    {r.image_redacted_url ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        src={r.image_redacted_url}
+                        alt={`Redacted evidence for ${r.category_label}`}
+                        className="w-16 h-12 object-cover rounded-lg border border-border bg-accent"
+                        onError={(e) => {
+                          // Signed URL expired — hide without crashing.
+                          (e.currentTarget as HTMLImageElement).style.display = "none";
+                        }}
+                      />
+                    ) : (
+                      <span className="text-muted-foreground text-xs">–</span>
+                    )}
                   </td>
                   <td className="px-4 py-3 text-muted-foreground hidden sm:table-cell max-w-[160px]">
                     <span className="truncate block text-xs">{r.area_text || "–"}</span>

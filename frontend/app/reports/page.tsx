@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { listReports, type Report } from "@/lib/api";
@@ -179,11 +179,53 @@ export default function ReportsPage() {
   const [reports, setReports] = useState<Report[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // Keep an up-to-date token ref so the Realtime refetch can use it without
+  // capturing a stale closure.
+  const tokenRef = useRef<string>("");
 
   useEffect(() => {
+    // cancelled is set to true when the effect is cleaned up (unmount or
+    // re-run).  All async continuations check this flag before touching state
+    // or creating subscriptions so that:
+    //   • state is never updated after unmount, and
+    //   • a stale async run does not create a zombie channel.
+    let cancelled = false;
+
+    // channel is set synchronously (before any await) so the cleanup function
+    // can always find and remove it, even when React Strict Mode fires the
+    // cleanup before the first async tick completes.
+    //
+    // We use a unique suffix so that each effect invocation gets a brand-new
+    // Supabase channel object.  Supabase internally caches channels by name;
+    // reusing "citizen-reports-status" across effect runs (before the previous
+    // channel is fully cleaned up) causes the SDK to find the already-subscribed
+    // object and throw:
+    //   "cannot add postgres_changes callbacks … after subscribe()"
+    const channelName = `citizen-reports-status-${Date.now()}`;
+    const channel = supabase
+      .channel(channelName)
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "reports" },
+        async () => {
+          // Re-fetch from backend to get the authoritative persisted status.
+          // Use the ref so we always have a non-stale token.
+          if (cancelled) return;
+          const freshToken = tokenRef.current;
+          if (!freshToken) return;
+          const { data: updated, error: fetchErr } = await listReports(freshToken);
+          // Guard again after the await — component may have unmounted.
+          if (cancelled) return;
+          if (!fetchErr && updated) {
+            setReports(updated.reports);
+          }
+        }
+      );
+
     async function loadReports() {
       // Check we have a session first.
       const { data: sessionData } = await supabase.auth.getSession();
+      if (cancelled) return;
       if (!sessionData.session) {
         router.push("/login");
         return;
@@ -195,21 +237,41 @@ export default function ReportsPage() {
       const { data: refreshData, error: refreshError } =
         await supabase.auth.refreshSession();
 
+      if (cancelled) return;
       if (refreshError || !refreshData.session) {
         // Refresh failed — session is dead; send to login.
         router.push("/login");
         return;
       }
 
-      const { data: d, error: e } = await listReports(
-        refreshData.session.access_token
-      );
+      const token = refreshData.session.access_token;
+      tokenRef.current = token;
+
+      const { data: d, error: e } = await listReports(token);
+      if (cancelled) return;
       setLoading(false);
       if (e) { setError(e); return; }
       setReports(d?.reports ?? []);
+
+      // -----------------------------------------------------------------------
+      // Supabase Realtime — subscribe to status changes on the reports table.
+      // The channel was created (and the postgres_changes handler registered)
+      // synchronously above, BEFORE this async function was called, so
+      // .subscribe() is always the final step — never called before .on().
+      // -----------------------------------------------------------------------
+      if (!cancelled) {
+        channel.subscribe();
+      }
     }
 
     loadReports();
+
+    return () => {
+      cancelled = true;
+      // Remove the channel regardless of whether subscribe() was reached.
+      // supabase.removeChannel handles channels that were never subscribed.
+      supabase.removeChannel(channel);
+    };
   }, [router]);
 
   return (

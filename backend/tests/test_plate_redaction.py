@@ -148,8 +148,8 @@ def test_no_plates_returns_image_unchanged(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_plate_region_is_black(monkeypatch):
-    """Detected plate bounding box must be filled with black (0, 0, 0)."""
+def test_plate_region_is_blurred(monkeypatch):
+    """Detected plate bounding box must be Gaussian-blurred, not filled with black."""
     import cv.privacy as privacy_mod
 
     px1, py1, px2, py2 = 100, 150, 200, 180  # plate bbox
@@ -161,13 +161,21 @@ def test_plate_region_is_black(monkeypatch):
     img = _make_gradient_image(400, 400)
     result = privacy_mod.redact_plates(img)
 
-    # Every pixel inside the plate bbox must be black.
-    for x in range(px1, px2, 5):  # sample every 5 pixels
-        for y in range(py1, py2, 5):
-            pixel = result.getpixel((x, y))
-            assert pixel == (0, 0, 0), (
-                f"Plate pixel at ({x},{y}) should be black (0,0,0), got {pixel}."
-            )
+    # The plate region must differ from the original (blur changed the pixels).
+    original_region = img.crop((px1, py1, px2, py2)).tobytes()
+    result_region = result.crop((px1, py1, px2, py2)).tobytes()
+    assert result_region != original_region, (
+        "Plate region must be blurred (pixels should differ from the original)."
+    )
+
+    # The plate region must NOT be solid black — blur preserves some colour info.
+    # Sample the centre pixel; a gradient image centre will not be (0,0,0).
+    cx = (px1 + px2) // 2
+    cy = (py1 + py2) // 2
+    centre_pixel = result.getpixel((cx, cy))
+    assert centre_pixel != (0, 0, 0), (
+        f"Plate centre pixel at ({cx},{cy}) must not be black after blur, got {centre_pixel}."
+    )
 
 
 def test_plate_region_differs_from_original(monkeypatch):
@@ -185,7 +193,7 @@ def test_plate_region_differs_from_original(monkeypatch):
     result = privacy_mod.redact_plates(img)
     result_region = result.crop((px1, py1, px2, py2)).tobytes()
 
-    assert result_region != original_region, "Plate region must be modified (blacked out)."
+    assert result_region != original_region, "Plate region must be modified (blurred)."
 
 
 def test_non_plate_region_preserved(monkeypatch):
@@ -237,8 +245,8 @@ def test_output_is_new_object_when_plates_detected(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_multiple_plates_all_blacked_out(monkeypatch):
-    """All detected plate bboxes must be filled with black."""
+def test_multiple_plates_all_blurred(monkeypatch):
+    """All detected plate bboxes must be Gaussian-blurred (differ from original)."""
     import cv.privacy as privacy_mod
 
     plates = [
@@ -255,12 +263,19 @@ def test_multiple_plates_all_blacked_out(monkeypatch):
     result = privacy_mod.redact_plates(img)
 
     for (px1, py1, px2, py2) in plates:
+        # The region bytes must differ from the original (blur changed the pixels).
+        orig_bytes = img.crop((px1, py1, px2, py2)).tobytes()
+        result_bytes = result.crop((px1, py1, px2, py2)).tobytes()
+        assert result_bytes != orig_bytes, (
+            f"Plate region ({px1},{py1},{px2},{py2}) was not blurred."
+        )
+        # The region must not be solid black.
         centre_x = (px1 + px2) // 2
         centre_y = (py1 + py2) // 2
         pixel = result.getpixel((centre_x, centre_y))
-        assert pixel == (0, 0, 0), (
+        assert pixel != (0, 0, 0), (
             f"Centre of plate bbox ({px1},{py1},{px2},{py2}) at ({centre_x},{centre_y}) "
-            f"should be black, got {pixel}."
+            f"must not be black after blur, got {pixel}."
         )
 
 

@@ -125,16 +125,29 @@ def get_signed_url(bucket: str, path: str) -> Optional[str]:
             path=path,
             expires_in=SIGNED_URL_EXPIRY_SECONDS,
         )
-        # supabase-py returns a dict with key "signedURL" or "signed_url" depending on version.
+        # supabase-py 2.7.4 / storage3 returns a dict with key "signedURL"
+        # (the full absolute URL is assembled by the client before returning).
+        # Earlier versions used "signed_url" or "signedUrl" — check all variants
+        # so the code is robust across patch upgrades.
         url = (
             result.get("signedURL")
             or result.get("signed_url")
             or result.get("signedUrl")
         )
+        if not url:
+            logger.warning(
+                "get_signed_url: Supabase returned a response for %s/%s but "
+                "no signed URL key was found. Response keys: %s. "
+                "Check that the bucket exists and RLS policies allow signed URLs.",
+                bucket, path, list(result.keys()) if isinstance(result, dict) else type(result),
+            )
         return url
     except Exception:
         logger.warning(
-            "get_signed_url: failed to create signed URL for %s/%s.", bucket, path, exc_info=True
+            "get_signed_url: failed to create signed URL for %s/%s. "
+            "Possible causes: bucket does not exist, RLS policy blocks access, "
+            "or storage credentials are invalid.",
+            bucket, path, exc_info=True,
         )
         return None
 

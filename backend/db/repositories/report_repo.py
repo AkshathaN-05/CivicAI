@@ -179,6 +179,10 @@ def update_report_status(
             # status (e.g. if a previous state was REJECTED and admin corrects).
             updates["rejection_reason"] = None
 
+        # supabase-py v2: .update() uses returning=representation by default,
+        # which sends "Prefer: return=representation" to PostgREST.  This causes
+        # the updated row to be returned in data when a matching row exists.
+        # If data is empty it means no row matched the eq() filter.
         result = (
             client.table(TABLE)
             .update(updates)
@@ -188,11 +192,22 @@ def update_report_status(
         data = result.data
         if data:
             return data[0]
+        # Update executed without error but returned no row — report_id not found.
         return None
-    except Exception:
-        logger.warning(
-            "update_report_status failed for report_id=%s.", report_id, exc_info=True
-        )
+    except Exception as exc:
+        exc_str = str(exc)
+        if "42703" in exc_str or "does not exist" in exc_str:
+            # Column missing — migration 007 has not been applied.
+            logger.error(
+                "update_report_status: reports.status column is MISSING — "
+                "migration 007 has not been applied to the remote database. "
+                "Apply supabase/migrations/007_report_status.sql via the Supabase "
+                "Dashboard SQL Editor or CLI.",
+            )
+        else:
+            logger.warning(
+                "update_report_status failed for report_id=%s.", report_id, exc_info=True
+            )
         return None
 
 

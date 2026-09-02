@@ -284,6 +284,49 @@ class TestStorageService:
             result = storage_service.get_signed_url("report-originals", "abc.jpg")
         assert result == "https://example.com/signed"
 
+    def test_get_signed_url_returns_none_when_no_url_key_in_response(self):
+        """Issue 1 regression: when Supabase returns a response but with no
+        recognised URL key, get_signed_url returns None (not raises) and logs
+        a warning.  This surfaces silent signed-URL failures that previously
+        caused image_redacted_url=None in production without any log output.
+        """
+        import logging
+        from services import storage_service
+
+        mock_storage = MagicMock()
+        mock_bucket = MagicMock()
+        mock_storage.from_.return_value = mock_bucket
+        # Simulate a response that has an unexpected key structure
+        mock_bucket.create_signed_url.return_value = {"error": "bucket not found"}
+
+        with patch("services.storage_service._get_storage_client", return_value=mock_storage):
+            with patch.object(storage_service.logger, "warning") as mock_warn:
+                result = storage_service.get_signed_url("report-redacted", "abc.jpg")
+
+        assert result is None
+        # Warning must have been logged — this is the diagnostic fix for Issue 1
+        assert mock_warn.called, (
+            "A warning must be logged when no signed URL key is found in the response. "
+            "This surfaces silent failures that cause image_redacted_url=None in production."
+        )
+
+    def test_get_redacted_signed_url_convenience_function(self):
+        """get_redacted_signed_url delegates to get_signed_url with correct bucket."""
+        from services import storage_service
+
+        mock_storage = MagicMock()
+        mock_bucket = MagicMock()
+        mock_storage.from_.return_value = mock_bucket
+        mock_bucket.create_signed_url.return_value = {
+            "signedURL": "https://supabase.co/storage/redacted/test.jpg?token=xyz"
+        }
+
+        with patch("services.storage_service._get_storage_client", return_value=mock_storage):
+            result = storage_service.get_redacted_signed_url("test-report.jpg")
+
+        assert result == "https://supabase.co/storage/redacted/test.jpg?token=xyz"
+        mock_storage.from_.assert_called_once_with("report-redacted")
+
 
 # ---------------------------------------------------------------------------
 # T3-3: AI pipeline integration via POST /reports/ (image upload)

@@ -668,8 +668,13 @@ def admin_update_report_status(
             ),
         )
 
-    # 3. Persist to Supabase if available; update in-memory store regardless.
-    db_updated = False
+    # 3. Persist to Supabase when available.
+    #
+    # IMPORTANT: when Supabase is enabled we MUST persist to the DB and return
+    # the DB-confirmed row.  We must NOT fall back to a silent in-memory update
+    # if the DB write fails — that would cause the Admin UI to display the new
+    # status while the DB (and therefore the citizen's view) still holds the
+    # old status.
     if _supabase_enabled():
         try:
             from db.repositories import report_repo
@@ -688,7 +693,6 @@ def admin_update_report_status(
                         redacted_path=updated_row.get("image_redacted_path"),
                     )
                     _STORE[report_id] = updated_report
-                    db_updated = True
                     logger.info(
                         "admin_update_report_status: report=%s %s→%s by admin=%s (Supabase)",
                         report_id,
@@ -697,17 +701,62 @@ def admin_update_report_status(
                         admin_user_id,
                     )
                     return updated_report
+
+            # Supabase is enabled but the update returned no row.  This means
+            # the DB write could not be confirmed (report missing in DB, RLS
+            # blocked the write, or a transient error occurred after the row
+            # was updated but before the response was received).
+            # Return an error — do NOT silently succeed with an in-memory value,
+            # as that would cause the citizen view to remain stale.
+            logger.error(
+                "admin_update_report_status: Supabase update for report=%s returned no "
+                "row — DB persistence could not be confirmed.  Refusing to return a "
+                "fake success.",
+                report_id,
+            )
+            raise HTTPException(
+                status_code=http_status.HTTP_502_BAD_GATEWAY,
+                detail=(
+                    "Status update could not be confirmed in the database. "
+                    "Please retry — the report status has not been changed."
+                ),
+            )
+
         except HTTPException:
-            raise  # Re-raise 404/422 without swallowing them
-        except Exception:
-            logger.warning(
-                "admin_update_report_status: Supabase update failed for report=%s — "
-                "applying in-memory update only.",
+            raise  # Re-raise 404/422/502 without swallowing them
+        except Exception as exc:
+            exc_str = str(exc)
+            if "42703" in exc_str or "does not exist" in exc_str:
+                # Column missing — migration 007 has not been applied.
+                logger.error(
+                    "admin_update_report_status: reports.status column missing for "
+                    "report=%s — migration 007 not applied.",
+                    report_id,
+                )
+                raise HTTPException(
+                    status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail=(
+                        "The database schema is missing required columns. "
+                        "Migration 007 (report status) must be applied before "
+                        "admin status management can function. "
+                        "Apply supabase/migrations/007_report_status.sql."
+                    ),
+                )
+            logger.error(
+                "admin_update_report_status: Supabase update failed for report=%s.",
                 report_id,
                 exc_info=True,
             )
+            raise HTTPException(
+                status_code=http_status.HTTP_502_BAD_GATEWAY,
+                detail=(
+                    "A database error occurred while updating the report status. "
+                    "Please retry."
+                ),
+            )
 
-    # 4. In-memory update (used when Supabase is unavailable or returned no row).
+    # 4. In-memory update — only reached when Supabase is NOT configured
+    #    (local dev / unit tests without a DB).
     updated_report = current_report.model_copy(
         update={
             "status": new_status,
@@ -716,14 +765,13 @@ def admin_update_report_status(
     )
     _STORE[report_id] = updated_report
 
-    if not db_updated:
-        logger.info(
-            "admin_update_report_status: report=%s %s→%s by admin=%s (in-memory only)",
-            report_id,
-            current_status.value,
-            new_status.value,
-            admin_user_id,
-        )
+    logger.info(
+        "admin_update_report_status: report=%s %s→%s by admin=%s (in-memory only — Supabase not configured)",
+        report_id,
+        current_status.value,
+        new_status.value,
+        admin_user_id,
+    )
 
     return updated_report
 

@@ -368,40 +368,102 @@ def test_too_short_bytes_rejected():
 
 
 def test_image_too_small_rejected():
-    """An image smaller than 200×200 px is rejected."""
+    """A tiny square image (10×10) is rejected — area and short side both too small."""
     from cv.image_validator import validate_image, ImageValidationError
 
-    raw = _make_jpeg_bytes(width=100, height=100)
+    raw = _make_jpeg_bytes(width=10, height=10)
     with pytest.raises(ImageValidationError, match="too small"):
         validate_image(raw, claimed_mime="image/jpeg")
 
 
-def test_image_width_too_small_rejected():
-    """An image where only width is below 200 px is rejected."""
+def test_image_very_small_square_rejected():
+    """A 40×40 image is rejected — shortest side (40) < MIN_SHORT_SIDE_PX (50)."""
     from cv.image_validator import validate_image, ImageValidationError
 
-    raw = _make_jpeg_bytes(width=100, height=400)
+    raw = _make_jpeg_bytes(width=40, height=40)
     with pytest.raises(ImageValidationError, match="too small"):
         validate_image(raw, claimed_mime="image/jpeg")
 
 
-def test_image_height_too_small_rejected():
-    """An image where only height is below 200 px is rejected."""
+def test_degenerate_single_row_rejected():
+    """A 50000×1 image (degenerate strip) is rejected — short side is 1 < 50."""
     from cv.image_validator import validate_image, ImageValidationError
 
-    raw = _make_jpeg_bytes(width=400, height=100)
+    # Can't create a real 50000×1 JPEG cheaply; use 100×1 (short side=1).
+    raw = _make_jpeg_bytes(width=100, height=1)
     with pytest.raises(ImageValidationError, match="too small"):
         validate_image(raw, claimed_mime="image/jpeg")
 
 
-def test_exactly_200x200_accepted():
-    """An image of exactly 200×200 px meets the minimum and is accepted."""
+def test_image_low_area_rejected():
+    """A 60×60 image passes short-side but area (3600) < MIN_AREA_PX (10000) → rejected."""
+    from cv.image_validator import validate_image, ImageValidationError
+
+    raw = _make_jpeg_bytes(width=60, height=60)
+    with pytest.raises(ImageValidationError, match="too small"):
+        validate_image(raw, claimed_mime="image/jpeg")
+
+
+# ---------------------------------------------------------------------------
+# Tests: minimum-dimension acceptance (portrait, landscape, square)
+# ---------------------------------------------------------------------------
+
+
+def test_landscape_image_accepted():
+    """A landscape image (344×180) must be accepted — this was the reported failing case."""
+    from cv.image_validator import validate_image
+
+    raw = _make_jpeg_bytes(width=344, height=180)
+    result = validate_image(raw, claimed_mime="image/jpeg")
+    assert isinstance(result, bytes)
+    assert result[:3] == b"\xff\xd8\xff", "Re-encoded landscape must be a JPEG."
+
+
+def test_portrait_image_accepted():
+    """A portrait image (180×344) must be accepted."""
+    from cv.image_validator import validate_image
+
+    raw = _make_jpeg_bytes(width=180, height=344)
+    result = validate_image(raw, claimed_mime="image/jpeg")
+    assert isinstance(result, bytes)
+    assert result[:3] == b"\xff\xd8\xff", "Re-encoded portrait must be a JPEG."
+
+
+def test_square_image_accepted():
+    """A square image (200×200) must be accepted."""
     from cv.image_validator import validate_image
 
     raw = _make_jpeg_bytes(width=200, height=200)
     result = validate_image(raw, claimed_mime="image/jpeg")
     assert isinstance(result, bytes)
-    assert result[:3] == b"\xff\xd8\xff"
+    assert result[:3] == b"\xff\xd8\xff", "Re-encoded square must be a JPEG."
+
+
+def test_wide_landscape_accepted():
+    """A very wide landscape image (800×100) passes: area=80000, short side=100."""
+    from cv.image_validator import validate_image
+
+    raw = _make_jpeg_bytes(width=800, height=100)
+    result = validate_image(raw, claimed_mime="image/jpeg")
+    assert isinstance(result, bytes)
+
+
+def test_tall_portrait_accepted():
+    """A very tall portrait image (100×800) passes: area=80000, short side=100."""
+    from cv.image_validator import validate_image
+
+    raw = _make_jpeg_bytes(width=100, height=800)
+    result = validate_image(raw, claimed_mime="image/jpeg")
+    assert isinstance(result, bytes)
+
+
+def test_minimum_threshold_boundary_accepted():
+    """An image of exactly 100×100 px passes both thresholds (area=10000, short=100)."""
+    from cv.image_validator import validate_image
+
+    raw = _make_jpeg_bytes(width=100, height=100)
+    result = validate_image(raw, claimed_mime="image/jpeg")
+    assert isinstance(result, bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -410,11 +472,12 @@ def test_exactly_200x200_accepted():
 
 
 def test_constants_values():
-    """Public constants have correct values per the T2-2 spec."""
+    """Public constants have correct values per the updated T2-2 spec."""
     from cv.image_validator import (
         ALLOWED_MIME_TYPES,
         MAX_FILE_SIZE_BYTES,
-        MIN_DIMENSION_PX,
+        MIN_AREA_PX,
+        MIN_SHORT_SIDE_PX,
         MAX_SIDE_PX,
     )
 
@@ -423,7 +486,8 @@ def test_constants_values():
     assert "image/webp" in ALLOWED_MIME_TYPES
     assert "image/gif" not in ALLOWED_MIME_TYPES
     assert MAX_FILE_SIZE_BYTES == 10 * 1024 * 1024
-    assert MIN_DIMENSION_PX == 200
+    assert MIN_AREA_PX == 10_000
+    assert MIN_SHORT_SIDE_PX == 50
     assert MAX_SIDE_PX == 1024
 
 

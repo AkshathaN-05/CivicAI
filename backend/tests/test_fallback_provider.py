@@ -79,6 +79,58 @@ class TestFallbackComplaintDescription:
         assert "garbage" in out.description.lower() or "overflow" in out.description.lower() or "civic" in out.description.lower()
         assert "Kadri Hills" in out.description
 
+
+    # -------------------------------------------------------------------------
+    # Bug 3 regression: spurious YOLO class (e.g. "frisbee") must NOT appear
+    # in the citizen-facing description when category is "other".
+    # -------------------------------------------------------------------------
+
+    def test_other_category_does_not_include_spurious_object_name(self):
+        """When YOLO detects a non-civic object (e.g. 'frisbee') and category
+        is 'other', the description must NOT mention 'frisbee'.
+
+        Before the fix, a pothole image that YOLO misclassified as 'frisbee'
+        produced a confusing description: 'Evidence confidence level: 11%.
+        Detected objects in the image: frisbee.'  This was misleading to citizens.
+        """
+        out = fallback_complaint_description(
+            category="other",
+            address="Near MG Road, Mangaluru",
+            confidence=0.11,
+            detected_objects="frisbee",
+        )
+        _assert_valid_llm_output(out)
+        assert "frisbee" not in out.description.lower(), (
+            "Spurious YOLO object 'frisbee' must not appear in description "
+            "when category is 'other'."
+        )
+
+    def test_known_civic_object_still_included_in_description(self):
+        """When YOLO detects a road-context object (e.g. 'car') and category is
+        'road_damage', the description SHOULD still mention the detected object.
+        """
+        out = fallback_complaint_description(
+            category="road_damage",
+            address="Hampankatta, Mangaluru",
+            confidence=0.75,
+            detected_objects="car",
+        )
+        _assert_valid_llm_output(out)
+        assert "car" in out.description.lower(), (
+            "Known civic object 'car' should appear in description for road_damage category."
+        )
+
+    def test_garbage_category_with_bottle_includes_object(self):
+        """Garbage overflow with detected 'bottle' → description includes 'bottle'."""
+        out = fallback_complaint_description(
+            category="garbage_overflow",
+            address="Attavar, Mangaluru",
+            confidence=0.70,
+            detected_objects="bottle",
+        )
+        assert "bottle" in out.description.lower()
+
+
     def test_detected_objects_included_when_provided(self):
         out = fallback_complaint_description(
             category="road_damage",
@@ -244,6 +296,89 @@ class TestFallbackClassifyCategory:
             detected_objects="x" * 400, address="y" * 400
         )
         assert len(out.description) <= 500
+
+    # -------------------------------------------------------------------------
+    # Issue 3 regression: address-keyword fallback when YOLO returns no match
+    # -------------------------------------------------------------------------
+
+    def test_pothole_in_address_maps_to_pothole_when_yolo_unrecognised(self):
+        """When YOLO returns an irrelevant class (e.g. 'frisbee'), the address
+        keyword 'pothole' should steer the category to IssueCategory.pothole."""
+        out = fallback_classify_category(
+            detected_objects="frisbee",
+            address="Large pothole near MG Road",
+        )
+        assert out.category == IssueCategory.pothole, (
+            f"Expected pothole from address keyword, got {out.category}"
+        )
+
+    def test_road_in_address_maps_to_road_damage_when_yolo_misses(self):
+        """Address mentions 'road damage' → road_damage category."""
+        out = fallback_classify_category(
+            detected_objects="skateboard",
+            address="Road damage at Hampankatta junction",
+        )
+        assert out.category == IssueCategory.road_damage
+
+    def test_garbage_in_address_maps_to_garbage_overflow(self):
+        """Address mentions 'garbage' → garbage_overflow category."""
+        out = fallback_classify_category(
+            detected_objects="",
+            address="Garbage overflow near Attavar junction Mangaluru",
+        )
+        assert out.category == IssueCategory.garbage_overflow
+
+    def test_sewage_in_address_maps_to_sewage(self):
+        out = fallback_classify_category(
+            detected_objects="",
+            address="Sewage leak near Derebail",
+        )
+        assert out.category == IssueCategory.sewage
+
+    def test_drain_in_address_maps_to_open_drain(self):
+        out = fallback_classify_category(
+            detected_objects="",
+            address="Open drain near the school",
+        )
+        assert out.category == IssueCategory.open_drain
+
+    def test_streetlight_in_address_maps_to_broken_streetlight(self):
+        out = fallback_classify_category(
+            detected_objects="kite",
+            address="Street light not working at Kadri park",
+        )
+        assert out.category == IssueCategory.broken_streetlight
+
+    def test_waterlogging_in_address_maps_to_waterlogging(self):
+        out = fallback_classify_category(
+            detected_objects="remote",
+            address="Waterlogging at Balmatta road after rain",
+        )
+        assert out.category == IssueCategory.waterlogging
+
+    def test_object_match_takes_priority_over_address(self):
+        """When YOLO objects match a category, that wins even if address says otherwise."""
+        out = fallback_classify_category(
+            detected_objects="toilet",    # → sewage
+            address="pothole near MG road",  # → would say pothole
+        )
+        # Object match (sewage from toilet) must win over address keyword (pothole)
+        assert out.category == IssueCategory.sewage
+
+    def test_no_match_anywhere_returns_other(self):
+        """Neither objects nor address match → other."""
+        out = fallback_classify_category(
+            detected_objects="frisbee",
+            address="Near the local school Mangaluru",
+        )
+        assert out.category == IssueCategory.other
+
+    def test_address_fallback_produces_valid_llm_output(self):
+        out = fallback_classify_category(
+            detected_objects="",
+            address="pothole on Kankanady road",
+        )
+        _assert_valid_llm_output(out)
 
 
 # ---------------------------------------------------------------------------
