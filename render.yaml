@@ -1,0 +1,38 @@
+services:
+  - type: web
+    name: civicai-backend
+    runtime: python
+    region: singapore          # closest to Mangaluru; change to oregon/frankfurt if preferred
+    plan: starter              # 512 MB RAM minimum; models lazy-load so startup is safe
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/v1/health
+    autoDeploy: true           # auto-deploy on every push to main (overridden by deploy hook)
+
+    envVars:
+      # -----------------------------------------------------------------------
+      # Set all values in the Render dashboard — never commit secrets here.
+      # -----------------------------------------------------------------------
+      - key: SUPABASE_URL
+        sync: false            # Render will prompt for value in dashboard
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false            # Set to your Vercel frontend URL, e.g. https://civicai.vercel.app
+      - key: ENV
+        value: production
+      - key: DEMO_USER_ID
+        value: ""              # Leave empty in production (real authenticated users)
+      # Python path so all backend modules resolve correctly
+      # rootDir=backend means CWD is already the backend folder; "." covers it.
+      - key: PYTHONPATH
+        value: .
+      # Disable .pt/.onnx model download progress bars in Render logs
+      - key: YOLO_VERBOSE
+        value: "False"
+      # Hugging Face cache — persist across deploys if a disk is attached
+      - key: HF_HOME
+        value: /opt/render/project/.cache/huggingface
