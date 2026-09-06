@@ -1,10 +1,11 @@
 """Prompt templates and prompt injection protection — T2-8.
 
-Three prompt templates are provided:
+Four prompt templates are provided:
 
-    COMPLAINT_DESCRIPTION_PROMPT  — generate a civic complaint description
-    RTI_DRAFT_PROMPT              — draft an RTI letter
-    CATEGORY_CLASSIFICATION_PROMPT — classify an ambiguous civic category
+    COMPLAINT_DESCRIPTION_PROMPT      — generate a civic complaint description
+    RTI_DRAFT_PROMPT                   — draft an RTI letter
+    CATEGORY_CLASSIFICATION_PROMPT    — classify an ambiguous civic category (text-only)
+    CIVIC_IMAGE_CLASSIFICATION_PROMPT — classify a civic image using vision model
 
 Public API:
 
@@ -112,4 +113,59 @@ CATEGORY_CLASSIFICATION_PROMPT: str = (
     "Do not invent new categories.\n"
     'Return JSON: {{"description": "...", "category": "...", '
     '"authority_recommendation": "...", "confidence": 0.0}}'
+)
+
+# ---------------------------------------------------------------------------
+# Vision-based civic image classification prompt
+# Used with Groq vision models (e.g. meta-llama/llama-4-scout-17b-16e-instruct)
+# when YOLO confidence is low or category is "other" to get accurate civic
+# classification based on the actual image content.
+# ---------------------------------------------------------------------------
+
+CIVIC_IMAGE_CLASSIFICATION_PROMPT: str = (
+    "You are a civic issue classification assistant for Mangaluru, India.\n"
+    "Carefully analyse the provided image and classify it.\n"
+    "\n"
+    "VALID CIVIC CATEGORIES (use EXACTLY one of these string values):\n"
+    "  pothole          — road with potholes, broken asphalt, exposed aggregate, "
+    "crater-like damage\n"
+    "  road_damage      — road surface damage, cracking, severe wear without a "
+    "distinct pothole\n"
+    "  broken_road_marking — faded/broken/missing lane or road markings\n"
+    "  waterlogging     — standing water, flooding on road or public space\n"
+    "  drainage         — blocked/failed/overflowing drain or stormwater channel\n"
+    "  sewage           — visible sewage overflow, wastewater discharge, sewer "
+    "manhole overflow\n"
+    "  water_leakage    — broken pipe, visible water escaping from civic "
+    "infrastructure\n"
+    "  garbage          — garbage/waste accumulation, overflowing bins, litter\n"
+    "  streetlight      — broken/non-functional streetlight or public light\n"
+    "  electrical       — exposed wires, electrical hazard on public infrastructure\n"
+    "  other_civic      — other genuine public infrastructure problem not listed\n"
+    "  invalid          — NOT a civic issue (selfie, animal, food, indoor personal "
+    "photo, screenshot, unrelated objects, etc.)\n"
+    "\n"
+    "RULES:\n"
+    "1. A road with one or more potholes → category=pothole, valid=true\n"
+    "2. Presence of people or vehicles does NOT make a civic image invalid.\n"
+    "3. A selfie, portrait, or person-only image with no civic issue → "
+    "category=invalid, valid=false\n"
+    "4. An unrelated non-civic image (food, animals, indoor personal) → "
+    "category=invalid, valid=false\n"
+    "5. Do NOT hallucinate measurements, causes, or locations not visible in "
+    "the image.\n"
+    "6. severity must be 'low', 'medium', or 'high' based solely on visible "
+    "evidence. Use null if genuinely uncertain.\n"
+    "7. category_confidence must reflect how certain you are about the "
+    "category (0.0–1.0).\n"
+    "8. severity_score: 0.0 for low, 0.5 for medium, 0.85 for high severity. "
+    "Use 0.0 for invalid images.\n"
+    "\n"
+    "Location hint (may be empty): {address}\n"
+    "\n"
+    "Respond with ONLY a valid JSON object — no markdown, no extra text:\n"
+    '{{"valid": true, "category": "pothole", "category_confidence": 0.94, '
+    '"severity": "high", "severity_score": 0.85, '
+    '"description": "Specific description of visible evidence.", '
+    '"reason": "Brief reason for the validity decision"}}'
 )

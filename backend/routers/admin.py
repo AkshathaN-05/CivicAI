@@ -4,6 +4,8 @@ Exposes:
   GET   /api/v1/admin/reports              — paginated list of all reports (admin only)
   GET   /api/v1/admin/stats                — aggregate statistics (admin only)
   PATCH /api/v1/admin/reports/{id}/status  — update report status (admin only)
+  GET   /api/v1/admin/reports/{id}/evidence— full evidence breakdown (admin only)
+  GET   /api/v1/admin/reports/{id}/links   — supporting evidence links (admin only)
 
 All endpoints require a valid JWT with app_role == "admin".
 Business logic lives in report_service.py — routers are thin handlers only
@@ -110,3 +112,89 @@ async def admin_update_report_status(
         rejection_reason=clean_reason,
         admin_user_id=admin_user_id,
     )
+
+
+@router.get("/reports/{report_id}/evidence")
+async def admin_get_evidence_breakdown(
+    report_id: str,
+    _admin: dict = Depends(require_role("admin")),
+):
+    """Return the full evidence breakdown for a single report — admin only.
+
+    The evidence_breakdown is stored in ai_raw_response JSONB.
+    It contains all confidence dimensions, decision reasoning, and notes.
+
+    IMPORTANT: Never expose this endpoint to citizens.
+    Evidence scores reflect the strength of submitted evidence only,
+    not a verified assessment of current road conditions.
+    """
+    from db.repositories import report_repo
+    from services import report_service
+
+    # Fetch the raw DB row (not the ReportOut, which drops evidence_breakdown)
+    row = None
+    if report_service._supabase_enabled():
+        try:
+            row = report_repo.get_report_by_id(report_id)
+        except Exception:
+            pass
+
+    if row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Report '{report_id}' not found.",
+        )
+
+    raw = row.get("ai_raw_response") or {}
+    breakdown = raw.get("evidence_breakdown") or {}
+
+    return {
+        "report_id": report_id,
+        "decision_state": row.get("decision_state"),
+        "evidence_score": row.get("evidence_score"),
+        "admin_priority": row.get("admin_priority"),
+        "visual_confidence": row.get("visual_confidence"),
+        "category_confidence": row.get("category_confidence"),
+        "location_confidence": row.get("location_confidence"),
+        "freshness_confidence": row.get("freshness_confidence"),
+        "severity": row.get("severity"),
+        "is_reopened": row.get("is_reopened", False),
+        "linked_report_id": row.get("linked_report_id"),
+        "image_reuse_flag": row.get("image_reuse_flag", False),
+        "gps_accuracy_metres": row.get("gps_accuracy_metres"),
+        "evidence_breakdown": breakdown,
+        "evidence_disclaimer": (
+            "Evidence scores reflect the strength of submitted evidence only, "
+            "not a verified assessment of current road conditions."
+        ),
+    }
+
+
+@router.get("/reports/{report_id}/links")
+async def admin_get_report_links(
+    report_id: str,
+    _admin: dict = Depends(require_role("admin")),
+):
+    """Return supporting evidence links for a report — admin only.
+
+    Returns all report_links where target_report_id = report_id.
+    Each entry represents a citizen submission that was linked as
+    supporting evidence (duplicate or reopened).
+    """
+    from db.repositories import report_repo
+    from services import report_service
+
+    if not report_service._supabase_enabled():
+        return {"report_id": report_id, "links": [], "total": 0}
+
+    try:
+        links = report_repo.get_report_links(report_id)
+    except Exception:
+        links = []
+
+    return {
+        "report_id": report_id,
+        "links": links,
+        "total": len(links),
+    }
+

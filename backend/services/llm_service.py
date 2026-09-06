@@ -1,7 +1,7 @@
 """LLM service orchestrator — T2-10.
 
 Provides a transparent Groq → deterministic-fallback provider chain for all
-three LLM use cases required by the CivicAI pipeline.
+LLM use cases required by the CivicAI pipeline.
 
 Public API:
 
@@ -15,12 +15,16 @@ Public API:
 
     async def classify_category(image_context: dict) -> IssueCategory
 
+    async def civic_classify_image(
+        image_bytes: bytes, address: str
+    ) -> CivicClassificationResult
+
 Provider chain (LOCKED — Part A §9):
     1. Try Groq (primary).
     2. On any exception or LLMOutputInvalid → use deterministic fallback.
     3. Log which provider was used (audit).
 
-The caller always receives a valid LLMOutput — the chain is transparent.
+The caller always receives a valid result — the chain is transparent.
 
 Design:
 - ``GROQ_API_KEY`` env var drives whether Groq is attempted.
@@ -33,6 +37,9 @@ Design:
   only the IssueCategory from the resulting LLMOutput.
 - generate_rti_draft uses T2-8 RTI_DRAFT_PROMPT rendered with complaint
   context + rag_context.
+- civic_classify_image uses CIVIC_IMAGE_CLASSIFICATION_PROMPT with the
+  actual image bytes via Groq vision model.  Falls back to heuristic
+  classification when Groq vision is unavailable.
 """
 from __future__ import annotations
 
@@ -41,6 +48,7 @@ import os
 from typing import Any
 
 from llm.fallback_provider import (
+    fallback_civic_classify_image,
     fallback_classify_category,
     fallback_complaint_description,
     fallback_rti_draft,
@@ -252,3 +260,74 @@ async def classify_category(image_context: dict[str, Any]) -> IssueCategory:
         result.category.value,
     )
     return result.category
+
+
+async def civic_classify_image(
+    image_bytes: bytes,
+    yolo_class: str,
+    all_class_names: tuple,
+    address: str,
+) -> "CivicClassificationResult":
+    """Classify a civic image using vision-based AI.
+
+    Primary path: Groq vision model (meta-llama/llama-4-scout-17b-16e-instruct)
+    receives the actual image and returns a structured civic classification.
+
+    Fallback path: heuristic classification from YOLO class names + address
+    keywords when Groq vision is unavailable.
+
+    The result's ``valid`` field indicates whether the image is a genuine
+    civic issue.  When ``valid=False`` (e.g. selfie, non-civic image), the
+    pipeline raises ImageValidationError.
+
+    Args:
+        image_bytes:     JPEG bytes of the validated/redacted image.
+        yolo_class:      Top-1 YOLO class name (may be empty or irrelevant).
+        all_class_names: All YOLO-detected class names (tuple, may be empty).
+        address:         Human-readable address/location string.
+
+    Returns:
+        :class:`~llm.groq_provider.CivicClassificationResult`.
+    """
+    from llm.groq_provider import CivicClassificationResult, civic_classify_image as _groq_classify
+
+    if _groq_available():
+        try:
+            result = await _groq_classify(image_bytes, address)
+            logger.info(
+                "llm_service.civic_classify_image: provider=groq_vision "
+                "valid=%s category=%s conf=%.2f",
+                result.valid,
+                result.category,
+                result.category_confidence,
+            )
+            return result
+        except LLMOutputInvalid as exc:
+            logger.warning(
+                "llm_service.civic_classify_image: groq_vision failed (%s) "
+                "— falling back to heuristic classifier.",
+                exc,
+            )
+
+    result = fallback_civic_classify_image(
+        yolo_class=yolo_class,
+        all_class_names=all_class_names,
+        address=address,
+    )
+    logger.info(
+        "llm_service.civic_classify_image: provider=heuristic_fallback "
+        "valid=%s category=%s conf=%.2f",
+        result.valid,
+        result.category,
+        result.category_confidence,
+    )
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Type alias re-export for callers
+# ---------------------------------------------------------------------------
+# Deferred import to avoid circular dependency at module load time.
+def _get_civic_classification_result_class():
+    from llm.groq_provider import CivicClassificationResult
+    return CivicClassificationResult

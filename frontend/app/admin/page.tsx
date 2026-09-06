@@ -593,7 +593,8 @@ export default function AdminPage() {
                 <th className="text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide px-4 py-3 hidden sm:table-cell">Location</th>
                 <th className="text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide px-4 py-3 hidden md:table-cell">Authority</th>
                 <th className="text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide px-4 py-3">Status</th>
-                <th className="text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide px-4 py-3 hidden lg:table-cell">Confidence</th>
+                <th className="text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide px-4 py-3 hidden lg:table-cell">Priority</th>
+                <th className="text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide px-4 py-3 hidden lg:table-cell">Evidence</th>
                 <th className="text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide px-4 py-3 hidden lg:table-cell">Submitted</th>
                 <th className="text-left text-xs font-semibold text-muted-foreground uppercase tracking-wide px-4 py-3">Actions</th>
               </tr>
@@ -612,6 +613,12 @@ export default function AdminPage() {
                         >
                           #{r.report_id.slice(0, 8).toUpperCase()}
                         </Link>
+                        {/* Decision state badge */}
+                        {r.decision_state && (
+                          <span className="mt-0.5 inline-block text-xs text-muted-foreground">
+                            {r.decision_state.replace(/_/g, " ")}
+                          </span>
+                        )}
                       </div>
                     </div>
                   </td>
@@ -655,8 +662,31 @@ export default function AdminPage() {
                       )}
                     </div>
                   </td>
+                  {/* Admin priority badge */}
+                  <td className="px-4 py-3 hidden lg:table-cell">
+                    {r.admin_priority ? (
+                      <span className={`inline-flex items-center text-xs font-semibold px-2 py-0.5 rounded-full border ${
+                        r.admin_priority === "CRITICAL" ? "bg-red-100 text-red-800 border-red-200" :
+                        r.admin_priority === "HIGH" ? "bg-orange-100 text-orange-800 border-orange-200" :
+                        r.admin_priority === "MEDIUM" ? "bg-yellow-100 text-yellow-800 border-yellow-200" :
+                        r.admin_priority === "REOPEN_REVIEW" ? "bg-purple-100 text-purple-800 border-purple-200" :
+                        r.admin_priority === "DUPLICATE" ? "bg-blue-100 text-blue-800 border-blue-200" :
+                        r.admin_priority === "INSUFFICIENT" ? "bg-gray-100 text-gray-500 border-gray-200" :
+                        "bg-gray-100 text-gray-500 border-gray-200"
+                      }`}>
+                        {r.admin_priority}
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground text-xs">–</span>
+                    )}
+                  </td>
+                  {/* Evidence strength (replaces raw confidence) */}
                   <td className="px-4 py-3 hidden lg:table-cell text-muted-foreground text-xs">
-                    {r.confidence > 0 ? `${Math.round(r.confidence * 100)}%` : "–"}
+                    {r.evidence_score != null
+                      ? `${Math.round(r.evidence_score * 100)}%`
+                      : r.confidence > 0
+                      ? `${Math.round(r.confidence * 100)}%`
+                      : "–"}
                   </td>
                   <td className="px-4 py-3 hidden lg:table-cell text-muted-foreground text-xs whitespace-nowrap">
                     {formatDate(r.created_at)}

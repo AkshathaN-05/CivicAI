@@ -117,6 +117,20 @@ class TestAIResultSchema:
             "yolo_class",
             "raw_detection_confidence",
             "match_reason",
+            # Evidence verification fields (new)
+            "decision_state",
+            "evidence_score",
+            "admin_priority",
+            "visual_confidence",
+            "category_confidence",
+            "location_confidence",
+            "freshness_confidence",
+            "severity",
+            "is_reopened",
+            "linked_report_id",
+            "image_reuse_flag",
+            "citizen_message",
+            "evidence_breakdown",
         }
         actual_fields = {f.name for f in fields(AIResult)}
         missing = required_fields - actual_fields
@@ -125,6 +139,38 @@ class TestAIResultSchema:
     def test_ai_result_is_dataclass(self):
         from dataclasses import is_dataclass
         assert is_dataclass(AIResult)
+
+    def test_evidence_fields_have_defaults(self):
+        """New evidence fields must have defaults so existing callers are not broken."""
+        # Construct with only the originally-required fields
+        from schemas.report import IssueCategory
+        import io
+        from PIL import Image as _PIL
+        buf = io.BytesIO()
+        _PIL.new("RGB", (10, 10), "white").save(buf, format="JPEG")
+        dummy_bytes = buf.getvalue()
+        result = AIResult(
+            redacted_image_bytes=dummy_bytes,
+            validated_image_bytes=dummy_bytes,
+            category=IssueCategory.pothole,
+            confidence=0.8,
+            authority_recommendation="MCC",
+            authority_id="mcc",
+            description="test",
+            image_hash="abc123",
+            is_duplicate=False,
+            duplicate_report_id=None,
+            llm_provider_used="fallback",
+            yolo_class="frisbee",
+            raw_detection_confidence=0.5,
+        )
+        # Check all evidence fields have sensible defaults
+        assert isinstance(result.decision_state, str)
+        assert isinstance(result.evidence_score, float)
+        assert isinstance(result.admin_priority, str)
+        assert isinstance(result.is_reopened, bool)
+        assert isinstance(result.image_reuse_flag, bool)
+        assert isinstance(result.evidence_breakdown, dict)
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +197,7 @@ class TestRunAIPipeline:
             image_bytes = VALID_JPEG
 
         mock_det = _mock_detection(detection_category, detection_confidence)
+        mock_det.all_class_names = ()  # ensure all_class_names is always set
 
         def _fake_detect(img):
             if yolo_side_effect:
@@ -172,12 +219,28 @@ class TestRunAIPipeline:
                 raise redact_side_effect
             return img  # return unchanged for speed
 
+        # Mock civic_classify_image for cases where vision classification is triggered
+        # (low confidence or category=other). Returns a simple valid civic result.
+        from llm.groq_provider import CivicClassificationResult
+
+        async def _fake_civic_classify(image_bytes, yolo_class, all_class_names, address):
+            return CivicClassificationResult(
+                valid=True,
+                category=detection_category.value,
+                category_confidence=detection_confidence if detection_confidence > 0 else 0.5,
+                severity="medium",
+                severity_score=0.5,
+                description="A civic issue has been detected.",
+                reason="mocked",
+            )
+
         with (
             patch("cv.pipeline.validate_image", wraps=__import__("cv.image_validator", fromlist=["validate_image"]).validate_image),
             patch("cv.detection.detect_civic_issue", side_effect=_fake_detect),
             patch("cv.privacy.redact_privacy", side_effect=_fake_redact_privacy),
             patch("services.llm_service.generate_complaint_description", new=_fake_gen_description),
             patch("services.llm_service.classify_category", new=_fake_classify),
+            patch("services.llm_service.civic_classify_image", new=_fake_civic_classify),
         ):
             return await run_ai_pipeline(
                 image_bytes,
@@ -304,13 +367,26 @@ class TestRunAIPipeline:
         assert isinstance(result.authority_recommendation, str)
         assert len(result.authority_recommendation) > 0
 
-    async def test_low_confidence_calls_classify_category(self):
-        """When YOLO confidence < 0.5 the LLM classify_category is called."""
-        classify_called = []
+    async def test_low_confidence_calls_civic_classify_image(self):
+        """When YOLO confidence < 0.5, civic_classify_image (vision) is called.
 
-        async def _tracking_classify(image_context):
-            classify_called.append(image_context)
-            return IssueCategory.garbage_overflow
+        Updated behavior: the pipeline now uses vision-based civic classification
+        (civic_classify_image) instead of classify_category for low-confidence
+        YOLO detections.  This is the core fix for the pothole misclassification bug.
+        """
+        vision_called = []
+
+        from llm.groq_provider import CivicClassificationResult
+
+        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address):
+            vision_called.append({"yolo_class": yolo_class, "address": address})
+            return CivicClassificationResult(
+                valid=True, category="garbage",
+                category_confidence=0.75,
+                severity="medium", severity_score=0.5,
+                description="Garbage overflow visible.",
+                reason="garbage_detected",
+            )
 
         async def _fake_gen_description(cv_result, location, address):
             return _mock_llm_output(cv_result.get("category", IssueCategory.other))
@@ -320,47 +396,68 @@ class TestRunAIPipeline:
             m.yolo_class = "bottle"
             m.confidence = 0.3  # below 0.5 threshold
             m.category = IssueCategory.garbage_overflow
+            m.all_class_names = ("bottle",)
             return m
 
         with (
             patch("cv.detection.detect_civic_issue", side_effect=_fake_detect),
             patch("cv.privacy.redact_privacy", side_effect=lambda img: img),
-            patch("services.llm_service.classify_category", new=_tracking_classify),
+            patch("services.llm_service.civic_classify_image", new=_tracking_vision),
             patch("services.llm_service.generate_complaint_description", new=_fake_gen_description),
         ):
             result = await run_ai_pipeline(
                 VALID_JPEG, location="", address="Mangaluru"
             )
 
-        assert classify_called, "classify_category should have been called for low confidence"
+        assert vision_called, (
+            "civic_classify_image (vision) should have been called for low confidence"
+        )
 
-    async def test_high_confidence_skips_classify_category(self):
-        """When YOLO confidence >= 0.5, classify_category is NOT called."""
-        classify_called = []
+    async def test_high_confidence_non_other_skips_civic_classify_image(self):
+        """When YOLO confidence >= 0.5 AND category != other, civic_classify_image
+        is NOT called; classify_category is used instead (existing flow).
+        """
+        vision_called = []
 
-        async def _tracking_classify(image_context):
-            classify_called.append(True)
-            return IssueCategory.road_damage
+        from llm.groq_provider import CivicClassificationResult
+
+        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address):
+            vision_called.append(True)
+            return CivicClassificationResult(
+                valid=True, category="road_damage",
+                category_confidence=0.9,
+                severity="medium", severity_score=0.5,
+                description="Road damage visible.",
+                reason="road_detected",
+            )
 
         async def _fake_gen(cv_result, location, address):
             return _mock_llm_output()
 
+        async def _fake_classify_cat(image_context):
+            return IssueCategory.road_damage
+
         def _fake_detect(img):
             m = MagicMock()
             m.yolo_class = "car"
-            m.confidence = 0.8  # >= 0.5 threshold
+            m.confidence = 0.8  # >= 0.5 AND category != other
             m.category = IssueCategory.road_damage
+            m.all_class_names = ("car",)
             return m
 
         with (
             patch("cv.detection.detect_civic_issue", side_effect=_fake_detect),
             patch("cv.privacy.redact_privacy", side_effect=lambda img: img),
-            patch("services.llm_service.classify_category", new=_tracking_classify),
+            patch("services.llm_service.civic_classify_image", new=_tracking_vision),
+            patch("services.llm_service.classify_category", new=_fake_classify_cat),
             patch("services.llm_service.generate_complaint_description", new=_fake_gen),
         ):
             result = await run_ai_pipeline(VALID_JPEG, location="", address="Mangaluru")
 
-        assert not classify_called, "classify_category should NOT be called for high confidence"
+        assert not vision_called, (
+            "civic_classify_image should NOT be called when YOLO conf >= 0.5 "
+            "and category != other"
+        )
 
     async def test_no_db_writes(self):
         """Pipeline must not make any DB calls."""
@@ -396,3 +493,564 @@ class TestRunAIPipeline:
         result = await self._run_with_mocks()
         gc.collect()  # Explicit cleanup should be safe post-pipeline
         assert isinstance(result, AIResult)
+
+
+# ---------------------------------------------------------------------------
+# Road model integration tests (requirements A–I from integration spec)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+class TestRoadModelIntegration:
+    """Tests for the local road-damage model integration in the pipeline.
+
+    All model inference is mocked.  Tests verify:
+    A. Confident pothole/road result — local model accepted, civic_classify_image skipped.
+    B. Low-confidence local result — local model rejected, civic_classify_image called.
+    C. Unsupported/non-road image — civic_classify_image handles it.
+    D. Local model failure — no crash, civic_classify_image called.
+    E. Selfie/person-only — remains invalid/rejected.
+    F. Civic image with people/vehicles — remains valid.
+    G. No GROQ_API_KEY — local road classification still works.
+    H. Privacy — road model receives redacted image, not original.
+    I. Pipeline ordering — road model attempted BEFORE civic_classify_image.
+    """
+
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
+
+    async def _run(
+        self,
+        *,
+        road_result=None,
+        road_side_effect=None,
+        vision_result=None,
+        vision_side_effect=None,
+        yolo_confidence: float = 0.1,
+        yolo_category=None,
+        image_bytes: bytes = None,
+    ) -> "AIResult":
+        """Run the pipeline with road model and vision both mocked."""
+        from cv.road_damage import RoadDamageResult
+
+        if image_bytes is None:
+            image_bytes = VALID_JPEG
+
+        if yolo_category is None:
+            from schemas.report import IssueCategory as _IC
+            yolo_category = _IC.other
+
+        if road_result is None:
+            road_result = RoadDamageResult(detected=False, category="", confidence=0.0)
+
+        if vision_result is None:
+            # Build a MagicMock so we don't need the groq package installed.
+            vision_result = MagicMock()
+            vision_result.valid = True
+            vision_result.category = "road_damage"
+            vision_result.category_confidence = 0.75
+            vision_result.severity = "medium"
+            vision_result.severity_score = 0.5
+            vision_result.description = "Civic issue detected."
+            vision_result.reason = "detected"
+
+        def _fake_road(image):
+            if road_side_effect is not None:
+                raise road_side_effect
+            return road_result
+
+        async def _fake_vision(image_bytes, yolo_class, all_class_names, address):
+            if vision_side_effect is not None:
+                raise vision_side_effect
+            return vision_result
+
+        def _fake_detect(img):
+            m = MagicMock()
+            m.yolo_class = "frisbee"
+            m.confidence = yolo_confidence
+            m.category = yolo_category
+            m.all_class_names = ()
+            return m
+
+        async def _fake_gen(cv_result, location, address):
+            from llm.output_validator import LLMOutput
+            from schemas.report import IssueCategory as _IC
+            cat = cv_result.get("category", _IC.other)
+            return LLMOutput(
+                category=cat,
+                description="A civic issue was detected.",
+                authority_recommendation="MCC",
+                confidence=0.8,
+            )
+
+        async def _fake_classify_cat(image_context):
+            from schemas.report import IssueCategory as _IC
+            return _IC.road_damage
+
+        with (
+            patch("cv.detection.detect_civic_issue", side_effect=_fake_detect),
+            patch("cv.privacy.redact_privacy", side_effect=lambda img: img),
+            patch("cv.road_damage.classify_road_damage", side_effect=_fake_road),
+            patch("services.llm_service.civic_classify_image", new=_fake_vision),
+            patch("services.llm_service.classify_category", new=_fake_classify_cat),
+            patch("services.llm_service.generate_complaint_description", new=_fake_gen),
+        ):
+            return await run_ai_pipeline(
+                image_bytes,
+                location="13.0,74.0",
+                address="MG Road, Mangaluru",
+            )
+
+    # ------------------------------------------------------------------
+    # A. Confident road result — civic_classify_image must be skipped
+    # ------------------------------------------------------------------
+
+    async def test_A_confident_pothole_uses_local_result(self):
+        """A. Confident pothole detection: local result accepted, vision NOT called."""
+        from cv.road_damage import RoadDamageResult
+        from schemas.report import IssueCategory
+
+        road_result = RoadDamageResult(detected=True, category="pothole",
+                                       confidence=0.82, raw_class="D40")
+        vision_calls = []
+
+        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address):
+            vision_calls.append(True)
+            v = MagicMock()
+            v.valid = True; v.category = "pothole"; v.category_confidence = 0.9
+            v.severity = "high"; v.severity_score = 0.85
+            v.description = "desc"; v.reason = "r"
+            return v
+
+        def _fake_road(image):
+            return road_result
+
+        def _fake_detect(img):
+            m = MagicMock()
+            m.yolo_class = "frisbee"
+            m.confidence = 0.1
+            m.category = IssueCategory.other
+            m.all_class_names = ()
+            return m
+
+        async def _fake_gen(cv_result, location, address):
+            from llm.output_validator import LLMOutput
+            return LLMOutput(category=IssueCategory.pothole,
+                             description="desc", authority_recommendation="MCC",
+                             confidence=0.82)
+
+        async def _fake_classify_cat(ctx):
+            return IssueCategory.road_damage
+
+        with (
+            patch("cv.detection.detect_civic_issue", side_effect=_fake_detect),
+            patch("cv.privacy.redact_privacy", side_effect=lambda img: img),
+            patch("cv.road_damage.classify_road_damage", side_effect=_fake_road),
+            patch("services.llm_service.civic_classify_image", new=_tracking_vision),
+            patch("services.llm_service.classify_category", new=_fake_classify_cat),
+            patch("services.llm_service.generate_complaint_description", new=_fake_gen),
+        ):
+            result = await run_ai_pipeline(
+                VALID_JPEG, location="", address="Mangaluru"
+            )
+
+        assert result.category == IssueCategory.pothole, (
+            f"Expected pothole, got {result.category}"
+        )
+        assert result.confidence == pytest.approx(0.82, abs=1e-6)
+        assert not vision_calls, "civic_classify_image must NOT be called when road model is confident"
+
+    async def test_A_confident_road_damage_uses_local_result(self):
+        """A. Confident road_damage (D00 crack): local result accepted, vision skipped."""
+        from cv.road_damage import RoadDamageResult
+        from schemas.report import IssueCategory
+
+        road_result = RoadDamageResult(detected=True, category="road_damage",
+                                       confidence=0.71, raw_class="D00")
+        result = await self._run(road_result=road_result)
+
+        assert result.category == IssueCategory.road_damage
+        assert result.confidence == pytest.approx(0.71, abs=1e-6)
+        assert result.llm_provider_used == "local_road_model"
+
+    # ------------------------------------------------------------------
+    # B. Low-confidence local result — vision must be called
+    # ------------------------------------------------------------------
+
+    async def test_B_low_confidence_falls_through_to_vision(self):
+        """B. Road model below threshold: vision must be called."""
+        from cv.road_damage import RoadDamageResult
+        from schemas.report import IssueCategory
+
+        # detected=False simulates below-threshold (road_damage.py already
+        # returns detected=False when conf < threshold)
+        road_result = RoadDamageResult(detected=False, category="", confidence=0.20)
+        vision_calls = []
+
+        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address):
+            vision_calls.append(True)
+            v = MagicMock()
+            v.valid = True; v.category = "garbage"; v.category_confidence = 0.75
+            v.severity = "medium"; v.severity_score = 0.5
+            v.description = "d"; v.reason = "r"
+            return v
+
+        def _fake_road(image):
+            return road_result
+
+        def _fake_detect(img):
+            m = MagicMock()
+            m.yolo_class = "bottle"
+            m.confidence = 0.1
+            m.category = IssueCategory.other
+            m.all_class_names = ()
+            return m
+
+        async def _fake_gen(cv_result, location, address):
+            from llm.output_validator import LLMOutput
+            return LLMOutput(category=IssueCategory.garbage_overflow,
+                             description="d", authority_recommendation="MCC",
+                             confidence=0.75)
+
+        async def _fake_classify_cat(ctx):
+            return IssueCategory.other
+
+        with (
+            patch("cv.detection.detect_civic_issue", side_effect=_fake_detect),
+            patch("cv.privacy.redact_privacy", side_effect=lambda img: img),
+            patch("cv.road_damage.classify_road_damage", side_effect=_fake_road),
+            patch("services.llm_service.civic_classify_image", new=_tracking_vision),
+            patch("services.llm_service.classify_category", new=_fake_classify_cat),
+            patch("services.llm_service.generate_complaint_description", new=_fake_gen),
+        ):
+            result = await run_ai_pipeline(
+                VALID_JPEG, location="", address="Mangaluru"
+            )
+
+        assert vision_calls, "civic_classify_image MUST be called when road model is not confident"
+
+    # ------------------------------------------------------------------
+    # C. Non-road civic image — vision still responsible
+    # ------------------------------------------------------------------
+
+    async def test_C_non_road_image_goes_to_vision(self):
+        """C. Non-road civic image: road model returns no detection, vision classifies."""
+        from cv.road_damage import RoadDamageResult
+        from schemas.report import IssueCategory
+
+        road_result = RoadDamageResult(detected=False, category="", confidence=0.0)
+        vision_result = MagicMock()
+        vision_result.valid = True; vision_result.category = "waterlogging"
+        vision_result.category_confidence = 0.88; vision_result.severity = "high"
+        vision_result.severity_score = 0.85; vision_result.description = "Flooding."
+        vision_result.reason = "r"
+        result = await self._run(road_result=road_result, vision_result=vision_result,
+                                 yolo_confidence=0.1)
+        assert result.category == IssueCategory.waterlogging
+
+    # ------------------------------------------------------------------
+    # D. Local model failure — no crash, vision called
+    # ------------------------------------------------------------------
+
+    async def test_D_road_model_failure_no_crash(self):
+        """D. Road model raises — pipeline does not crash; vision is called."""
+        from schemas.report import IssueCategory
+
+        vision_calls = []
+        _vr = MagicMock()
+        _vr.valid = True; _vr.category = "drainage"; _vr.category_confidence = 0.80
+        _vr.severity = "medium"; _vr.severity_score = 0.5
+        _vr.description = "d"; _vr.reason = "r"
+
+        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address):
+            vision_calls.append(True)
+            return _vr
+
+        def _fake_detect(img):
+            m = MagicMock()
+            m.yolo_class = "car"
+            m.confidence = 0.1
+            m.category = IssueCategory.other
+            m.all_class_names = ()
+            return m
+
+        async def _fake_gen(cv_result, location, address):
+            from llm.output_validator import LLMOutput
+            return LLMOutput(category=IssueCategory.open_drain,
+                             description="d", authority_recommendation="MCC",
+                             confidence=0.8)
+
+        async def _fake_classify_cat(ctx):
+            return IssueCategory.other
+
+        with (
+            patch("cv.detection.detect_civic_issue", side_effect=_fake_detect),
+            patch("cv.privacy.redact_privacy", side_effect=lambda img: img),
+            patch("cv.road_damage.classify_road_damage",
+                  side_effect=RuntimeError("model crashed")),
+            patch("services.llm_service.civic_classify_image", new=_tracking_vision),
+            patch("services.llm_service.classify_category", new=_fake_classify_cat),
+            patch("services.llm_service.generate_complaint_description", new=_fake_gen),
+        ):
+            result = await run_ai_pipeline(
+                VALID_JPEG, location="", address="Mangaluru"
+            )
+
+        assert isinstance(result, AIResult), "Pipeline must not raise when road model fails"
+        assert vision_calls, "civic_classify_image must be called after road model failure"
+
+    # ------------------------------------------------------------------
+    # E. Selfie/person-only — still rejected
+    # ------------------------------------------------------------------
+
+    async def test_E_selfie_rejected_even_with_road_model(self):
+        """E. Selfie: image remains invalid regardless of road model."""
+        from cv.road_damage import RoadDamageResult
+        from cv.image_validator import ImageValidationError
+        from schemas.report import IssueCategory
+
+        # Road model finds nothing (correct — selfie is not a road)
+        road_result = RoadDamageResult(detected=False, category="", confidence=0.0)
+        # Vision model says invalid (selfie) — use MagicMock, no groq package needed.
+        vision_result = MagicMock()
+        vision_result.valid = False; vision_result.category = "invalid"
+        vision_result.category_confidence = 0.0; vision_result.severity = None
+        vision_result.severity_score = 0.0
+        vision_result.description = "This appears to be a selfie."
+        vision_result.reason = "non_civic_image"
+
+        def _fake_detect(img):
+            m = MagicMock()
+            m.yolo_class = "person"
+            m.confidence = 0.1
+            m.category = IssueCategory.other
+            m.all_class_names = ("person",)
+            return m
+
+        async def _fake_vision(image_bytes, yolo_class, all_class_names, address):
+            return vision_result
+
+        async def _fake_gen(cv_result, location, address):
+            from llm.output_validator import LLMOutput
+            return LLMOutput(category=IssueCategory.other,
+                             description="d", authority_recommendation="MCC",
+                             confidence=0.0)
+
+        async def _fake_classify_cat(ctx):
+            return IssueCategory.other
+
+        with (
+            patch("cv.detection.detect_civic_issue", side_effect=_fake_detect),
+            patch("cv.privacy.redact_privacy", side_effect=lambda img: img),
+            patch("cv.road_damage.classify_road_damage",
+                  side_effect=lambda img: road_result),
+            patch("services.llm_service.civic_classify_image", new=_fake_vision),
+            patch("services.llm_service.classify_category", new=_fake_classify_cat),
+            patch("services.llm_service.generate_complaint_description", new=_fake_gen),
+        ):
+            with pytest.raises(ImageValidationError):
+                await run_ai_pipeline(VALID_JPEG, location="", address="Mangaluru")
+
+    # ------------------------------------------------------------------
+    # F. Genuine civic image with people/vehicles — remains valid
+    # ------------------------------------------------------------------
+
+    async def test_F_civic_image_with_people_remains_valid(self):
+        """F. Civic image with pedestrians: must be accepted."""
+        from schemas.report import IssueCategory
+
+        # High-confidence YOLO: road_damage — road model is NOT invoked in this path
+        result = await self._run(
+            yolo_confidence=0.8,
+            yolo_category=IssueCategory.road_damage,
+        )
+        assert isinstance(result, AIResult)
+        assert result.category == IssueCategory.road_damage
+
+    # ------------------------------------------------------------------
+    # G. No GROQ_API_KEY — local road classification still works
+    # ------------------------------------------------------------------
+
+    async def test_G_no_groq_key_local_road_model_still_works(self):
+        """G. With GROQ_API_KEY unset, local road model still classifies correctly."""
+        from cv.road_damage import RoadDamageResult
+        from schemas.report import IssueCategory
+
+        road_result = RoadDamageResult(detected=True, category="pothole",
+                                       confidence=0.78, raw_class="D40")
+        vision_calls = []
+
+        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address):
+            vision_calls.append(True)
+            v = MagicMock()
+            v.valid = True; v.category = "pothole"; v.category_confidence = 0.9
+            v.severity = "high"; v.severity_score = 0.85; v.description = "d"; v.reason = "r"
+            return v
+
+        def _fake_road(image):
+            return road_result
+
+        def _fake_detect(img):
+            m = MagicMock()
+            m.yolo_class = "frisbee"
+            m.confidence = 0.1
+            m.category = IssueCategory.other
+            m.all_class_names = ()
+            return m
+
+        async def _fake_gen(cv_result, location, address):
+            from llm.output_validator import LLMOutput
+            return LLMOutput(category=IssueCategory.pothole,
+                             description="d", authority_recommendation="MCC",
+                             confidence=0.78)
+
+        async def _fake_classify_cat(ctx):
+            return IssueCategory.other
+
+        saved_key = os.environ.pop("GROQ_API_KEY", None)
+        try:
+            with (
+                patch("cv.detection.detect_civic_issue", side_effect=_fake_detect),
+                patch("cv.privacy.redact_privacy", side_effect=lambda img: img),
+                patch("cv.road_damage.classify_road_damage", side_effect=_fake_road),
+                patch("services.llm_service.civic_classify_image", new=_tracking_vision),
+                patch("services.llm_service.classify_category", new=_fake_classify_cat),
+                patch("services.llm_service.generate_complaint_description",
+                      new=_fake_gen),
+            ):
+                result = await run_ai_pipeline(
+                    VALID_JPEG, location="", address="Mangaluru"
+                )
+        finally:
+            if saved_key is not None:
+                os.environ["GROQ_API_KEY"] = saved_key
+
+        assert result.category == IssueCategory.pothole
+        assert not vision_calls, "vision must be skipped when road model is confident"
+
+    # ------------------------------------------------------------------
+    # H. Privacy — road model receives the redacted image
+    # ------------------------------------------------------------------
+
+    async def test_H_road_model_receives_redacted_image(self):
+        """H. The road model must receive the privacy-redacted image bytes."""
+        from cv.road_damage import RoadDamageResult
+        from schemas.report import IssueCategory
+        import io as _io
+
+        received_images = []
+
+        original_bytes = VALID_JPEG
+        # Redaction marker: create a blue image as "redacted"
+        from PIL import Image as _PILImage
+        redacted_image_pil = _PILImage.new("RGB", (300, 300), color="blue")
+
+        def _fake_redact(img):
+            # Return a distinctly blue image as the "redacted" version
+            return redacted_image_pil
+
+        def _fake_road(image):
+            received_images.append(image)
+            return RoadDamageResult(detected=False, category="", confidence=0.0)
+
+        def _fake_detect(img):
+            m = MagicMock()
+            m.yolo_class = "frisbee"
+            m.confidence = 0.1
+            m.category = IssueCategory.other
+            m.all_class_names = ()
+            return m
+
+        async def _fake_vision(image_bytes, yolo_class, all_class_names, address):
+            v = MagicMock()
+            v.valid = True; v.category = "road_damage"; v.category_confidence = 0.7
+            v.severity = "medium"; v.severity_score = 0.5; v.description = "d"; v.reason = "r"
+            return v
+
+        async def _fake_gen(cv_result, location, address):
+            from llm.output_validator import LLMOutput
+            return LLMOutput(category=IssueCategory.road_damage,
+                             description="d", authority_recommendation="MCC",
+                             confidence=0.7)
+
+        async def _fake_classify_cat(ctx):
+            return IssueCategory.road_damage
+
+        with (
+            patch("cv.detection.detect_civic_issue", side_effect=_fake_detect),
+            patch("cv.privacy.redact_privacy", side_effect=_fake_redact),
+            patch("cv.road_damage.classify_road_damage", side_effect=_fake_road),
+            patch("services.llm_service.civic_classify_image", new=_fake_vision),
+            patch("services.llm_service.classify_category", new=_fake_classify_cat),
+            patch("services.llm_service.generate_complaint_description", new=_fake_gen),
+        ):
+            await run_ai_pipeline(original_bytes, location="", address="Mangaluru")
+
+        assert received_images, "Road model was not called"
+        # The image passed to the road model must be the blue "redacted" image,
+        # not the original gray image.
+        received = received_images[0]
+        # Redacted image is blue (0, 0, 255); original is gray (128, 128, 128).
+        pixel = received.convert("RGB").getpixel((150, 150))
+        assert pixel[2] > pixel[0], (
+            f"Road model should receive blue redacted image, got pixel={pixel}. "
+            "Original image is gray — model received wrong (unredacted) image."
+        )
+
+    # ------------------------------------------------------------------
+    # I. Pipeline ordering — road model before civic_classify_image
+    # ------------------------------------------------------------------
+
+    async def test_I_road_model_attempted_before_civic_classify_image(self):
+        """I. Road model must be attempted BEFORE civic_classify_image."""
+        from cv.road_damage import RoadDamageResult
+        from schemas.report import IssueCategory
+
+        call_order = []
+
+        def _fake_road(image):
+            call_order.append("road_model")
+            return RoadDamageResult(detected=False, category="", confidence=0.0)
+
+        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address):
+            call_order.append("civic_classify_image")
+            v = MagicMock()
+            v.valid = True; v.category = "garbage"; v.category_confidence = 0.75
+            v.severity = "medium"; v.severity_score = 0.5; v.description = "d"; v.reason = "r"
+            return v
+
+        def _fake_detect(img):
+            m = MagicMock()
+            m.yolo_class = "bottle"
+            m.confidence = 0.1
+            m.category = IssueCategory.other
+            m.all_class_names = ()
+            return m
+
+        async def _fake_gen(cv_result, location, address):
+            from llm.output_validator import LLMOutput
+            return LLMOutput(category=IssueCategory.garbage_overflow,
+                             description="d", authority_recommendation="MCC",
+                             confidence=0.75)
+
+        async def _fake_classify_cat(ctx):
+            return IssueCategory.other
+
+        with (
+            patch("cv.detection.detect_civic_issue", side_effect=_fake_detect),
+            patch("cv.privacy.redact_privacy", side_effect=lambda img: img),
+            patch("cv.road_damage.classify_road_damage", side_effect=_fake_road),
+            patch("services.llm_service.civic_classify_image", new=_tracking_vision),
+            patch("services.llm_service.classify_category", new=_fake_classify_cat),
+            patch("services.llm_service.generate_complaint_description", new=_fake_gen),
+        ):
+            await run_ai_pipeline(VALID_JPEG, location="", address="Mangaluru")
+
+        assert "road_model" in call_order, "Road model was not called"
+        assert "civic_classify_image" in call_order, "civic_classify_image was not called"
+        road_idx = call_order.index("road_model")
+        vision_idx = call_order.index("civic_classify_image")
+        assert road_idx < vision_idx, (
+            f"Road model (pos {road_idx}) must run BEFORE civic_classify_image "
+            f"(pos {vision_idx}). Actual order: {call_order}"
+        )

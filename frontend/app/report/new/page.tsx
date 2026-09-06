@@ -171,6 +171,7 @@ export default function NewReportPage() {
   const [preview, setPreview] = useState<string | null>(null);
   const [captureError, setCaptureError] = useState<string | null>(null);
   const [submittingCapture, setSubmittingCapture] = useState(false);
+  const [gpsAccuracy, setGpsAccuracy] = useState<number | null>(null);
 
   // AI result from Stage 1 POST
   const [aiReport, setAiReport] = useState<Report | null>(null);
@@ -351,8 +352,9 @@ export default function NewReportPage() {
     setLocationError(null);
     navigator.geolocation.getCurrentPosition(
       (pos) => {
-        const { latitude, longitude } = pos.coords;
+        const { latitude, longitude, accuracy } = pos.coords;
         setCoords({ lat: latitude, lng: longitude });
+        setGpsAccuracy(accuracy ?? null);
         setAreaText(`${latitude.toFixed(5)}, ${longitude.toFixed(5)}`);
         setLocationState("detected");
         setLocationError(null);
@@ -405,6 +407,10 @@ export default function NewReportPage() {
     if (coords) {
       fd.append("lat", String(coords.lat));
       fd.append("lng", String(coords.lng));
+    }
+    // GPS accuracy — optional, passed when available from browser geolocation
+    if (gpsAccuracy !== null) {
+      fd.append("gps_accuracy", String(gpsAccuracy));
     }
 
     const { data, error } = await createReport(fd, token);
@@ -781,6 +787,21 @@ export default function NewReportPage() {
     const conf = aiReport.confidence;
     const lowConf = conf < 0.6;
     const isDuplicate = aiReport.is_duplicate;
+    // Evidence verification: decision state message
+    const decisionState = aiReport.decision_state;
+    const citizenMessage = aiReport.citizen_message;
+
+    // Select banner style by decision state
+    const bannerStyle =
+      decisionState === "duplicate_active_report"
+        ? "bg-blue-50 border-blue-200 text-blue-800"
+        : decisionState === "possible_reopened_issue"
+        ? "bg-amber-50 border-amber-200 text-amber-800"
+        : decisionState === "insufficient_evidence"
+        ? "bg-yellow-50 border-yellow-200 text-yellow-700"
+        : decisionState === "valid_civic_report"
+        ? "bg-green-50 border-green-200 text-green-800"
+        : "bg-gray-50 border-gray-200 text-gray-700";
 
     return (
       <div className="max-w-2xl mx-auto px-4 py-10">
@@ -791,6 +812,16 @@ export default function NewReportPage() {
             The AI has analysed your photo. Review the results below — edit anything that looks wrong, then confirm.
           </p>
         </div>
+
+        {/* ── Decision state banner (evidence verification) ── */}
+        {citizenMessage && decisionState && decisionState !== "needs_admin_review" && (
+          <div className={`flex items-start gap-2.5 px-4 py-3 rounded-xl border mb-5 text-sm ${bannerStyle}`}>
+            <svg className="w-4 h-4 mt-0.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M11.25 11.25l.041-.02a.75.75 0 0 1 1.063.852l-.708 2.836a.75.75 0 0 0 1.063.853l.041-.021M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9-3.75h.008v.008H12V8.25Z" />
+            </svg>
+            <span>{citizenMessage}</span>
+          </div>
+        )}
 
         {/* ── AI result card ── */}
         <div className="border border-border rounded-xl bg-card divide-y divide-border mb-5">
@@ -851,8 +882,8 @@ export default function NewReportPage() {
           )}
         </div>
 
-        {/* Duplicate advisory — only if AI flagged it */}
-        {isDuplicate && (
+        {/* Duplicate advisory — only if AI flagged it and no citizen_message already shown */}
+        {isDuplicate && !citizenMessage && (
           <div className="flex items-start gap-2 text-xs text-orange-700 bg-orange-50 border border-orange-200 px-4 py-3 rounded-xl mb-5">
             <svg className="w-4 h-4 mt-0.5 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
               <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126ZM12 15.75h.007v.008H12v-.008Z" />

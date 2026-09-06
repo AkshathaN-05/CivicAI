@@ -13,7 +13,11 @@ AI Flow (Part A §23, LOCKED):
     7. Confidence score (T2-6) → evidence confidence
     8. Authority routing (ADR-001) → authority recommendation
     9. LLM (T2-10):
-       - if YOLO confidence < 0.5 → classify_category first
+       - if YOLO confidence < 0.5 OR category == other:
+           → civic_classify_image (vision-based classification)
+             uses actual image content for accurate civic classification.
+             If result.valid=False → raise ImageValidationError (invalid image).
+             If result is a genuine civic category → override category.
        - always → generate_complaint_description
     10. Return AIResult
 
@@ -84,10 +88,25 @@ class AIResult:
         image_hash:            BLAKE3 hex digest of validated image bytes (T2-7).
         is_duplicate:          True when a hash-match duplicate is found (T2-7).
         duplicate_report_id:   ID of the duplicate report, or None (T2-7).
-        llm_provider_used:     "groq", "fallback", or "none".
+        llm_provider_used:     "groq", "groq_vision", "fallback", or "none".
         yolo_class:            Top-1 YOLO class name (empty string if none).
         raw_detection_confidence: Raw YOLOv8n confidence before weighting.
         match_reason:          Human-readable authority match reason.
+
+        -- Evidence verification fields (new) --
+        decision_state:        DecisionState string value.
+        evidence_score:        Weighted multi-signal evidence score [0.0, 1.0].
+        admin_priority:        AdminPriority string value.
+        visual_confidence:     Image-only AI detection confidence [0.0, 1.0].
+        category_confidence:   Model certainty about the civic category [0.0, 1.0].
+        location_confidence:   GPS quality + plausibility [0.0, 1.0].
+        freshness_confidence:  Temporal recency signal [0.0, 1.0].
+        severity:              Civic impact severity ('low'/'medium'/'high').
+        is_reopened:           True when decision_state = possible_reopened_issue.
+        linked_report_id:      UUID of linked active/resolved report (or None).
+        image_reuse_flag:      True when same hash found in non-active report.
+        citizen_message:       User-facing message (hedged language, no scores).
+        evidence_breakdown:    Admin-only dict for explainability.
     """
 
     redacted_image_bytes: bytes
@@ -104,6 +123,20 @@ class AIResult:
     yolo_class: str
     raw_detection_confidence: float
     match_reason: str = field(default="")
+    # Evidence verification fields
+    decision_state: str = field(default="needs_admin_review")
+    evidence_score: float = field(default=0.0)
+    admin_priority: str = field(default="INSUFFICIENT")
+    visual_confidence: float = field(default=0.0)
+    category_confidence: float = field(default=0.0)
+    location_confidence: float = field(default=0.0)
+    freshness_confidence: float = field(default=0.0)
+    severity: str = field(default="low")
+    is_reopened: bool = field(default=False)
+    linked_report_id: Optional[str] = field(default=None)
+    image_reuse_flag: bool = field(default=False)
+    citizen_message: str = field(default="")
+    evidence_breakdown: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -168,6 +201,16 @@ async def run_ai_pipeline(
     address: str = "",
     claimed_mime: str = "",
     existing_hashes: Optional[list] = None,
+    # Evidence verification parameters (new, optional — backward compatible)
+    gps_accuracy: Optional[float] = None,
+    submission_timestamp=None,  # datetime | None
+    # Decision engine callbacks (injected by service layer; None = no DB queries)
+    lookup_hash_active=None,
+    lookup_hash_historical=None,
+    find_nearby_active=None,
+    find_nearby_resolved=None,
+    # Severity from vision model (optional — passed when available)
+    vision_severity: str = "low",
 ) -> AIResult:
     """Run the full CivicAI AI pipeline on raw image bytes.
 
@@ -181,6 +224,13 @@ async def run_ai_pipeline(
         existing_hashes: Optional list of known hashes (or (hash, id) tuples) from
                          the caller for duplicate detection.  The full geo+hash DB
                          query is the service layer's responsibility.
+        gps_accuracy:    GPS accuracy radius in metres from browser geolocation API.
+        submission_timestamp: Server-side submission datetime (defaults to now()).
+        lookup_hash_active:   Callback (hash) -> Optional[HashLookupResult]
+        lookup_hash_historical: Callback (hash) -> Optional[HashLookupResult]
+        find_nearby_active:   Callback (lat, lng, category, radius) -> list
+        find_nearby_resolved: Callback (lat, lng, category, radius, days) -> list
+        vision_severity:  Severity from vision model ('low'/'medium'/'high').
 
     Returns:
         :class:`AIResult` with all fields populated.
@@ -237,6 +287,7 @@ async def run_ai_pipeline(
     yolo_class: str = ""
     raw_detection_confidence: float = 0.0
     category: IssueCategory = IssueCategory.other
+    all_class_names: tuple = ()
 
     try:
         from cv.detection import detect_civic_issue
@@ -246,6 +297,7 @@ async def run_ai_pipeline(
         yolo_class = detection.yolo_class
         raw_detection_confidence = detection.confidence
         category = detection.category
+        all_class_names = detection.all_class_names
         del pil_for_yolo
         gc.collect()
         logger.debug(
@@ -306,18 +358,183 @@ async def run_ai_pipeline(
         logger.warning("pipeline: step 8 (authority) failed: %s", exc)
 
     # -----------------------------------------------------------------------
-    # Step 9: LLM (T2-10)
-    # Per architecture §9: classify_category if YOLO confidence < 0.5
-    # Then always generate_complaint_description
+    # Step 9: Classification + LLM (T2-10)
+    #
+    # 9a. LOCAL ROAD-DAMAGE MODEL (new):
+    #     When YOLO confidence < 0.5 OR category is "other", try the local
+    #     RDD2022-trained road-damage model first.  This model specialises in
+    #     road surface classes (D00/D10/D20 → road_damage; D40 → pothole) and
+    #     is the correct tool for classifying pothole images that COCO YOLO
+    #     misclassifies as irrelevant objects (e.g. "frisbee").
+    #     If the local model is confident (≥ threshold), use its result and
+    #     SKIP the remote Groq vision call entirely.
+    #
+    # 9b. CIVIC IMAGE CLASSIFICATION (vision-based):
+    #     Used when YOLO confidence < 0.5 OR category is "other" AND the local
+    #     road model is not confident (non-road civic images: drainage, sewage,
+    #     garbage, waterlogging, etc.).
+    #     Sends the actual redacted image to Groq vision (or heuristic fallback).
+    #     If result.valid=False → raise ImageValidationError (invalid/non-civic).
+    #
+    # 9c. COMPLAINT DESCRIPTION:
+    #     Always generates a description using the (possibly updated) category.
     # -----------------------------------------------------------------------
     description: str = ""
     llm_provider_used: str = "none"
 
-    try:
-        from services.llm_service import classify_category, generate_complaint_description
+    # Determine if we need classification beyond the YOLO COCO result.
+    # Trigger condition: YOLO gave us no useful civic signal.
+    _needs_civic_classification = (
+        raw_detection_confidence < 0.5
+        or category == IssueCategory.other
+    )
 
-        # Use LLM to refine category when YOLO confidence is low.
-        if raw_detection_confidence < 0.5:
+    try:
+        from services.llm_service import civic_classify_image, generate_complaint_description
+        from llm.fallback_provider import map_vision_category_to_issue_category
+
+        # -------------------------------------------------------------------
+        # Step 9a: Local road-damage model
+        # -------------------------------------------------------------------
+        _road_model_used = False
+        if _needs_civic_classification:
+            try:
+                from cv.road_damage import classify_road_damage
+
+                # Privacy requirement: road model receives the redacted image,
+                # not the original validated (pre-redaction) bytes.
+                pil_for_road = Image.open(io.BytesIO(redacted_bytes))
+                road_result = classify_road_damage(pil_for_road)
+                del pil_for_road
+                gc.collect()
+
+                if road_result.detected:
+                    # Local road model gave a confident road-damage result.
+                    # Accept it directly and skip the remote vision API.
+                    from llm.fallback_provider import map_vision_category_to_issue_category as _map
+                    new_category = _map(road_result.category)
+                    logger.info(
+                        "pipeline: step 9a (local road model) — %s (conf=%.2f, "
+                        "raw=%s) → category=%s",
+                        road_result.category,
+                        road_result.confidence,
+                        road_result.raw_class,
+                        new_category.value,
+                    )
+                    category = new_category
+                    confidence = road_result.confidence
+                    _road_model_used = True
+                    _needs_civic_classification = False  # skip remote vision
+                    llm_provider_used = "local_road_model"
+
+                    # Re-route authority for the road category.
+                    try:
+                        from services.authority_service import route_to_authority as _route
+                        auth_dict2, match_reason2, _ = _route(
+                            category.value, effective_address
+                        )
+                        if auth_dict2:
+                            authority_recommendation = auth_dict2.get(
+                                "short_name", authority_recommendation
+                            )
+                            authority_id = auth_dict2.get("id", authority_id)
+                            match_reason = match_reason2
+                    except Exception as exc2:
+                        logger.warning(
+                            "pipeline: step 9a (re-route authority after road model) "
+                            "failed: %s",
+                            exc2,
+                        )
+                else:
+                    logger.debug(
+                        "road_damage: no confident road detection (conf=%.3f) "
+                        "— proceeding to vision fallback",
+                        road_result.confidence,
+                    )
+            except Exception as exc_road:
+                logger.warning(
+                    "pipeline: step 9a (local road model) failed gracefully: %s",
+                    exc_road,
+                )
+
+        if _needs_civic_classification:
+            # 9a: Vision-based civic classification
+            vision_result = await civic_classify_image(
+                image_bytes=redacted_bytes,
+                yolo_class=yolo_class,
+                all_class_names=all_class_names,
+                address=effective_address,
+            )
+
+            logger.debug(
+                "pipeline: step 9a (vision classify) — valid=%s category=%s conf=%.2f "
+                "severity=%s yolo_was='%s'",
+                vision_result.valid,
+                vision_result.category,
+                vision_result.category_confidence,
+                vision_result.severity,
+                yolo_class,
+            )
+
+            # If vision model says the image is NOT a civic issue, reject it.
+            if not vision_result.valid:
+                logger.info(
+                    "pipeline: step 9a (vision classify) — image rejected as non-civic: "
+                    "category=%s reason=%s",
+                    vision_result.category,
+                    vision_result.reason,
+                )
+                raise ImageValidationError(
+                    "This image does not appear to show a civic issue. "
+                    "Please upload a photo of a road, pothole, garbage, drainage, "
+                    "streetlight, water issue, or other public infrastructure problem. "
+                    f"({vision_result.reason})"
+                )
+
+            # Map vision category to canonical IssueCategory
+            new_category = map_vision_category_to_issue_category(vision_result.category)
+
+            # Use vision classification confidence as the new category confidence.
+            # This replaces the misleading "YOLO conf × weight" score that produced
+            # values like 4.4% for a pothole image (YOLO conf=0.11, weight=0.4).
+            new_confidence = vision_result.category_confidence
+
+            if new_category != category or abs(new_confidence - confidence) > 0.05:
+                logger.info(
+                    "pipeline: step 9a (vision classify) — updated: "
+                    "YOLO(%s/%.2f) → vision(%s/%.2f)",
+                    category.value, confidence,
+                    new_category.value, new_confidence,
+                )
+                category = new_category
+                confidence = new_confidence
+
+                # Use vision-generated description as primary description
+                # (specific to the image content, not a generic template).
+                if vision_result.description:
+                    description = vision_result.description
+
+                # Re-route authority for the updated category.
+                try:
+                    from services.authority_service import route_to_authority as _route
+                    auth_dict2, match_reason2, _ = _route(
+                        category.value, effective_address
+                    )
+                    if auth_dict2:
+                        authority_recommendation = auth_dict2.get("short_name", authority_recommendation)
+                        authority_id = auth_dict2.get("id", authority_id)
+                        match_reason = match_reason2
+                except Exception as exc2:
+                    logger.warning("pipeline: step 9a (re-route authority) failed: %s", exc2)
+
+            import os as _os
+            llm_provider_used = "groq_vision" if _os.environ.get("GROQ_API_KEY", "").strip() else "fallback"
+
+        elif not _road_model_used:
+            # High-confidence YOLO detection with a non-"other" category.
+            # Use existing LLM classify_category for refinement (original flow).
+            # Skipped when the local road model already produced a confident result.
+            from services.llm_service import classify_category
             image_context = {
                 "detected_objects": yolo_class,
                 "address": effective_address,
@@ -330,31 +547,165 @@ async def run_ai_pipeline(
                     category.value, raw_detection_confidence, llm_category.value,
                 )
                 category = llm_category
-                # Re-compute confidence with LLM-derived category.
                 try:
                     confidence = compute_confidence(raw_detection_confidence, category)
                 except Exception:
                     pass
 
-        # Generate complaint description.
-        cv_result = {
-            "category": category,
-            "confidence": confidence,
-            "yolo_class": yolo_class,
-        }
-        llm_out = await generate_complaint_description(cv_result, location, effective_address)
-        description = llm_out.description
-        # If Groq key is configured, provider could be groq; else fallback.
-        import os
-        llm_provider_used = "groq" if os.environ.get("GROQ_API_KEY", "").strip() else "fallback"
-        logger.debug("pipeline: step 9 (LLM description) — %d chars", len(description))
+            import os as _os
+            llm_provider_used = "groq" if _os.environ.get("GROQ_API_KEY", "").strip() else "fallback"
+
+        # 9b: Generate complaint description (if not already set by vision result)
+        if not description:
+            cv_result = {
+                "category": category,
+                "confidence": confidence,
+                "yolo_class": yolo_class,
+            }
+            llm_out = await generate_complaint_description(cv_result, location, effective_address)
+            description = llm_out.description
+            logger.debug("pipeline: step 9b (LLM description) — %d chars", len(description))
+
     except Exception as exc:
+        # Re-raise ImageValidationError so the router returns HTTP 422.
+        from cv.image_validator import ImageValidationError as _IVE
+        if isinstance(exc, _IVE):
+            raise
         logger.warning("pipeline: step 9 (LLM) failed — using empty description: %s", exc)
         llm_provider_used = "none"
 
     # -----------------------------------------------------------------------
+    # Step 10: Evidence verification (new)
+    # Compute confidence dimensions, run decision engine, attach verdict.
+    # -----------------------------------------------------------------------
+    from datetime import datetime as _dt, timezone as _tz
+
+    # Parse lat/lng from the location string if not passed directly
+    _lat: Optional[float] = None
+    _lng: Optional[float] = None
+    if location:
+        try:
+            parts = location.split(",")
+            if len(parts) == 2:
+                _lat = float(parts[0].strip())
+                _lng = float(parts[1].strip())
+        except (ValueError, AttributeError):
+            pass
+
+    # Build confidence dimensions
+    # visual_confidence: from the AI classification path
+    #   local road model → road_result.confidence
+    #   groq vision → vision_result.category_confidence
+    #   YOLO+weight  → confidence (compute_confidence output)
+    _visual_conf: float = min(max(float(confidence), 0.0), 1.0)
+    _category_conf: float = _visual_conf  # same source for now; road model confidence IS the category confidence
+
+    # location_confidence: GPS quality + Mangaluru plausibility
+    _location_conf: float = _compute_location_confidence(_lat, _lng, gps_accuracy)
+
+    # freshness_confidence: EXIF + submission recency
+    _now = submission_timestamp if submission_timestamp is not None else _dt.now(_tz.utc)
+    _freshness_conf: float = _compute_freshness_confidence(validated_bytes, _now)
+
+    # Run decision engine if any callback is provided; otherwise produce defaults
+    _evidence_result = None
+    if any(cb is not None for cb in [lookup_hash_active, lookup_hash_historical,
+                                      find_nearby_active, find_nearby_resolved]):
+        try:
+            from cv.decision_engine import (
+                DecisionContext,
+                DecisionEngine,
+                HashLookupResult,
+            )
+            _ctx = DecisionContext(
+                image_hash=image_hash or "",
+                category=category.value,
+                lat=_lat,
+                lng=_lng,
+                gps_accuracy_metres=gps_accuracy,
+                submission_time=_now,
+                visual_confidence=_visual_conf,
+                category_confidence=_category_conf,
+                location_confidence=_location_conf,
+                freshness_confidence=_freshness_conf,
+                severity=vision_severity or "low",
+            )
+            _engine = DecisionEngine(
+                lookup_hash_active=lookup_hash_active or (lambda h: None),
+                lookup_hash_historical=lookup_hash_historical or (lambda h: None),
+                find_nearby_active=find_nearby_active or (lambda la, ln, cat, r: []),
+                find_nearby_resolved=find_nearby_resolved or (lambda la, ln, cat, r, d: []),
+            )
+            _evidence_result = _engine.decide(_ctx)
+            logger.info(
+                "pipeline: step 10 (evidence) — state=%s score=%.3f priority=%s",
+                _evidence_result.decision_state,
+                _evidence_result.evidence_score,
+                _evidence_result.admin_priority,
+            )
+        except Exception as exc:
+            logger.warning("pipeline: step 10 (evidence) failed — using defaults: %s", exc)
+    else:
+        # No DB callbacks — compute score-only decision (offline / test mode)
+        try:
+            from cv.evidence_scorer import (
+                compute_evidence_score,
+                VALID_THRESHOLD,
+                REVIEW_THRESHOLD,
+            )
+            from cv.decision_engine import _assign_admin_priority, _citizen_message
+            _ev_score = compute_evidence_score(
+                _visual_conf, _category_conf, _location_conf, _freshness_conf
+            )
+            if _ev_score >= VALID_THRESHOLD:
+                _state = "valid_civic_report"
+            elif _ev_score >= REVIEW_THRESHOLD:
+                _state = "needs_admin_review"
+            else:
+                _state = "insufficient_evidence"
+            _priority = _assign_admin_priority(_state, _ev_score, _visual_conf, vision_severity or "low")
+
+            class _SimpleResult:
+                decision_state = _state
+                evidence_score = _ev_score
+                admin_priority = _priority
+                is_reopened = False
+                linked_report_id = None
+                image_reuse_flag = False
+                image_reuse_prior_report_id = None
+                image_reuse_prior_status = None
+                citizen_message = _citizen_message(_state)
+                evidence_breakdown: dict = {
+                    "visual_confidence": _visual_conf,
+                    "category_confidence": _category_conf,
+                    "location_confidence": _location_conf,
+                    "freshness_confidence": _freshness_conf,
+                    "evidence_score": _ev_score,
+                    "decision_state": _state,
+                    "admin_priority": _priority,
+                    "severity": vision_severity or "low",
+                    "evidence_disclaimer": (
+                        "Evidence scores reflect the strength of submitted evidence only, "
+                        "not a verified assessment of current road conditions."
+                    ),
+                }
+
+            _evidence_result = _SimpleResult()
+        except Exception as exc:
+            logger.warning("pipeline: step 10 (evidence score-only) failed: %s", exc)
+
+    # -----------------------------------------------------------------------
     # Final result
     # -----------------------------------------------------------------------
+    _ev = _evidence_result
+
+    # Backward-compat: keep legacy is_duplicate/duplicate_report_id populated
+    _final_is_dup = is_duplicate
+    _final_dup_id = duplicate_report_id
+    if _ev and _ev.decision_state == "duplicate_active_report":
+        _final_is_dup = True
+        _final_dup_id = _final_dup_id or _ev.linked_report_id
+
     result = AIResult(
         redacted_image_bytes=redacted_bytes,
         validated_image_bytes=validated_bytes,
@@ -364,20 +715,124 @@ async def run_ai_pipeline(
         authority_id=authority_id,
         description=description,
         image_hash=image_hash,
-        is_duplicate=is_duplicate,
-        duplicate_report_id=duplicate_report_id,
+        is_duplicate=_final_is_dup,
+        duplicate_report_id=_final_dup_id,
         llm_provider_used=llm_provider_used,
         yolo_class=yolo_class,
         raw_detection_confidence=raw_detection_confidence,
         match_reason=match_reason,
+        # Evidence verification fields
+        decision_state=_ev.decision_state if _ev else "needs_admin_review",
+        evidence_score=_ev.evidence_score if _ev else 0.0,
+        admin_priority=_ev.admin_priority if _ev else "INSUFFICIENT",
+        visual_confidence=_visual_conf,
+        category_confidence=_category_conf,
+        location_confidence=_location_conf,
+        freshness_confidence=_freshness_conf,
+        severity=vision_severity or "low",
+        is_reopened=_ev.is_reopened if _ev else False,
+        linked_report_id=_ev.linked_report_id if _ev else None,
+        image_reuse_flag=_ev.image_reuse_flag if _ev else False,
+        citizen_message=_ev.citizen_message if _ev else "",
+        evidence_breakdown=_ev.evidence_breakdown if _ev else {},
     )
 
     logger.info(
-        "pipeline: complete — category=%s confidence=%.3f is_duplicate=%s "
-        "provider=%s",
+        "pipeline: complete — category=%s confidence=%.3f decision=%s "
+        "evidence_score=%.3f priority=%s provider=%s",
         result.category.value,
         result.confidence,
-        result.is_duplicate,
+        result.decision_state,
+        result.evidence_score,
+        result.admin_priority,
         result.llm_provider_used,
     )
     return result
+
+
+# ---------------------------------------------------------------------------
+# Evidence confidence helpers (pure functions, no model loading)
+# ---------------------------------------------------------------------------
+
+_MANGALURU_BBOX = {
+    "lat_min": 12.7, "lat_max": 13.1,
+    "lng_min": 74.7, "lng_max": 75.1,
+}
+
+
+def _compute_location_confidence(
+    lat: Optional[float],
+    lng: Optional[float],
+    gps_accuracy: Optional[float],
+) -> float:
+    """Return location_confidence in [0.0, 1.0].
+
+    GPS accuracy is a corroborating signal only — it does NOT prove the photo
+    was taken at the reported coordinates.
+    """
+    if lat is None or lng is None:
+        return 0.30  # text-only location
+
+    # Plausibility: is the location within the Mangaluru service area?
+    in_bbox = (
+        _MANGALURU_BBOX["lat_min"] <= lat <= _MANGALURU_BBOX["lat_max"]
+        and _MANGALURU_BBOX["lng_min"] <= lng <= _MANGALURU_BBOX["lng_max"]
+    )
+
+    if gps_accuracy is None:
+        base = 0.60  # GPS present but no accuracy info
+    elif gps_accuracy <= 20:
+        base = 0.85  # precise GPS (≤20 m)
+    elif gps_accuracy <= 50:
+        base = 0.70  # reasonable mobile GPS (≤50 m)
+    else:
+        base = 0.40  # imprecise GPS (>50 m)
+
+    if not in_bbox:
+        return round(base * 0.1, 4)  # location outside service area → very low
+
+    return base
+
+
+def _compute_freshness_confidence(
+    validated_bytes: bytes,
+    submission_time,
+) -> float:
+    """Return freshness_confidence in [0.0, 1.0].
+
+    Uses EXIF DateTimeOriginal if available; falls back to 0.50 default.
+    EXIF timestamps are NOT treated as proof — they are one corroborating signal.
+    """
+    try:
+        from PIL import Image as _PIL, ExifTags as _ExifTags
+        import io as _io
+        from datetime import datetime as _dt, timezone as _tz
+
+        img = _PIL.open(_io.BytesIO(validated_bytes))
+        exif_data = img._getexif() if hasattr(img, "_getexif") else None
+        if exif_data:
+            # Find DateTimeOriginal tag
+            date_tag = next(
+                (k for k, v in _ExifTags.TAGS.items() if v == "DateTimeOriginal"),
+                None,
+            )
+            if date_tag and date_tag in exif_data:
+                raw_dt = exif_data[date_tag]
+                exif_time = _dt.strptime(raw_dt, "%Y:%m:%d %H:%M:%S").replace(
+                    tzinfo=_tz.utc
+                )
+                if submission_time.tzinfo is None:
+                    submission_time = submission_time.replace(tzinfo=_tz.utc)
+                age_seconds = abs((submission_time - exif_time).total_seconds())
+                if age_seconds < 3600:        # < 1 hour
+                    return 0.90
+                elif age_seconds < 86400:     # < 24 hours
+                    return 0.75
+                elif age_seconds < 604800:    # < 7 days
+                    return 0.55
+                else:
+                    return 0.25               # image is older than 7 days
+    except Exception:
+        pass  # EXIF unavailable or unreadable — use default
+
+    return 0.50  # default: submission timestamp is authoritative

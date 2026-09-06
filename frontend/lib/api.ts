@@ -35,6 +35,23 @@ export interface Authority {
   phone: string;
 }
 
+export type DecisionState =
+  | "invalid_image"
+  | "insufficient_evidence"
+  | "duplicate_active_report"
+  | "possible_reopened_issue"
+  | "valid_civic_report"
+  | "needs_admin_review";
+
+export type AdminPriority =
+  | "CRITICAL"
+  | "HIGH"
+  | "MEDIUM"
+  | "LOW"
+  | "REOPEN_REVIEW"
+  | "DUPLICATE"
+  | "INSUFFICIENT";
+
 export interface Report {
   report_id: string;
   category: IssueCategory;
@@ -56,6 +73,15 @@ export interface Report {
   duplicate_report_id: string | null;
   yolo_class: string | null;
   llm_provider_used: string | null;
+  // Evidence verification fields
+  decision_state: DecisionState | null;
+  evidence_score: number | null;
+  admin_priority: AdminPriority | null;
+  severity: string | null;
+  is_reopened: boolean;
+  linked_report_id: string | null;
+  image_reuse_flag: boolean;
+  citizen_message: string | null;
 }
 
 export interface ReportPatchRequest {
@@ -115,6 +141,7 @@ async function apiFetch<T>(
 }
 
 // POST /api/v1/reports/ — requires auth token (JWT from Supabase session)
+// FormData must include optional gps_accuracy field (metres, float) when available.
 export async function createReport(formData: FormData, token: string) {
   return apiFetch<Report>(
     "/api/v1/reports/",
@@ -184,6 +211,58 @@ export async function adminUpdateReportStatus(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     },
+    token
+  );
+}
+
+// -------------------------------------------------------------------------
+// Evidence verification admin API
+// -------------------------------------------------------------------------
+
+export interface EvidenceBreakdown {
+  report_id: string;
+  decision_state: DecisionState | null;
+  evidence_score: number | null;
+  admin_priority: AdminPriority | null;
+  visual_confidence: number | null;
+  category_confidence: number | null;
+  location_confidence: number | null;
+  freshness_confidence: number | null;
+  severity: string | null;
+  is_reopened: boolean;
+  linked_report_id: string | null;
+  image_reuse_flag: boolean;
+  gps_accuracy_metres: number | null;
+  evidence_breakdown: Record<string, unknown> | null;
+  evidence_disclaimer: string;
+}
+
+export interface ReportLinks {
+  report_id: string;
+  links: Array<{
+    id: string;
+    source_report_id: string;
+    target_report_id: string;
+    link_type: "duplicate" | "supporting_evidence" | "reopened";
+    created_at: string;
+  }>;
+  total: number;
+}
+
+// GET /api/v1/admin/reports/{id}/evidence — admin only
+export async function adminGetEvidenceBreakdown(reportId: string, token: string) {
+  return apiFetch<EvidenceBreakdown>(
+    `/api/v1/admin/reports/${reportId}/evidence`,
+    undefined,
+    token
+  );
+}
+
+// GET /api/v1/admin/reports/{id}/links — admin only
+export async function adminGetReportLinks(reportId: string, token: string) {
+  return apiFetch<ReportLinks>(
+    `/api/v1/admin/reports/${reportId}/links`,
+    undefined,
     token
   );
 }

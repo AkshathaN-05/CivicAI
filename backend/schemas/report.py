@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -48,6 +48,31 @@ class ReportStatus(str, Enum):
 
 
 # ---------------------------------------------------------------------------
+# Evidence verification enums (evidence-verification architecture)
+# ---------------------------------------------------------------------------
+
+class DecisionState(str, Enum):
+    """Canonical decision state assigned by the evidence decision engine."""
+    invalid_image           = "invalid_image"
+    insufficient_evidence   = "insufficient_evidence"
+    duplicate_active_report = "duplicate_active_report"
+    possible_reopened_issue = "possible_reopened_issue"
+    valid_civic_report      = "valid_civic_report"
+    needs_admin_review      = "needs_admin_review"
+
+
+class AdminPriority(str, Enum):
+    """Deterministic triage classification for the admin dashboard."""
+    CRITICAL      = "CRITICAL"
+    HIGH          = "HIGH"
+    MEDIUM        = "MEDIUM"
+    LOW           = "LOW"
+    REOPEN_REVIEW = "REOPEN_REVIEW"
+    DUPLICATE     = "DUPLICATE"
+    INSUFFICIENT  = "INSUFFICIENT"
+
+
+# ---------------------------------------------------------------------------
 # Authority sub-schema
 # ---------------------------------------------------------------------------
 
@@ -67,6 +92,8 @@ class ReportCreate(BaseModel):
     category: IssueCategory
     area_text: str = Field(..., min_length=2, max_length=500)
     description: str = Field(..., min_length=10, max_length=2000)
+    # GPS accuracy from browser geolocation API (optional, metres)
+    gps_accuracy: Optional[float] = Field(None, ge=0.0)
 
     @field_validator("area_text", "description", mode="before")
     @classmethod
@@ -101,6 +128,19 @@ class ReportOut(BaseModel):
     yolo_class: Optional[str] = None
     # Admin status management — rejection reason visible to citizen (if rejected)
     rejection_reason: Optional[str] = None
+    # Evidence verification architecture fields
+    decision_state: Optional[str] = None
+    evidence_score: Optional[float] = Field(None, ge=0.0, le=1.0)
+    admin_priority: Optional[str] = None
+    severity: Optional[str] = None
+    is_reopened: bool = False
+    linked_report_id: Optional[str] = None
+    image_reuse_flag: bool = False
+    # citizen_message: shown to citizen instead of raw scores
+    citizen_message: Optional[str] = None
+    # evidence_breakdown: admin-only (never returned to citizens in public endpoints)
+    # Returned ONLY by GET /api/v1/admin/reports/{id}/evidence
+    evidence_breakdown: Optional[Any] = None
 
 
 class ReportListOut(BaseModel):

@@ -54,6 +54,7 @@ async def create_report(
     description: Optional[str] = Form(None),
     lat: Optional[float] = Form(None),
     lng: Optional[float] = Form(None),
+    gps_accuracy: Optional[float] = Form(None),  # GPS accuracy in metres (optional)
     photo: Optional[UploadFile] = File(None),
     current_user: dict = Depends(get_current_user),
 ):
@@ -117,6 +118,7 @@ async def create_report(
                 lng=lng,
                 address=clean_area_text,
                 user_id=user_id,
+                gps_accuracy=gps_accuracy,
             )
             return report
         except Exception as exc:

@@ -1,5 +1,13 @@
 """Report repository — Supabase data-access layer.
 
+Evidence verification queries added:
+  find_nearby_active_reports(lat, lng, category, radius_m)
+  find_nearby_resolved_reports(lat, lng, category, radius_m, window_days)
+  lookup_hash_active(image_hash)
+  lookup_hash_historical(image_hash)
+  insert_report_link(source_id, target_id, link_type)
+  get_report_links(target_report_id)
+
 Field mapping between the service/API layer and the public.reports table:
 
   API / service         DB column
@@ -250,3 +258,205 @@ def update_report_fields(
             "update_report_fields failed for report_id=%s.", report_id, exc_info=True
         )
         return None
+
+
+# ---------------------------------------------------------------------------
+# Evidence verification queries (evidence-verification architecture)
+# ---------------------------------------------------------------------------
+
+_ACTIVE_STATUSES = ("SUBMITTED", "UNDER_REVIEW")
+
+
+def lookup_hash_active(image_hash: str) -> Optional[dict]:
+    """Return the first active report matching image_hash, or None.
+
+    'Active' means status IN ('SUBMITTED', 'UNDER_REVIEW').
+    Used by Step 1 of the decision engine (exact-hash active check).
+    """
+    from db.supabase_client import get_client
+
+    client = get_client()
+    if client is None or not image_hash:
+        return None
+
+    try:
+        result = (
+            client.table(TABLE)
+            .select("id, status, image_hash")
+            .eq("image_hash", image_hash)
+            .in_("status", list(_ACTIVE_STATUSES))
+            .limit(1)
+            .execute()
+        )
+        data = result.data
+        if data:
+            return data[0]
+        return None
+    except Exception:
+        logger.warning("lookup_hash_active failed.", exc_info=True)
+        return None
+
+
+def lookup_hash_historical(image_hash: str) -> Optional[dict]:
+    """Return the first NON-active report matching image_hash, or None.
+
+    Used by Step 2 of the decision engine (image_reuse_flag).
+    """
+    from db.supabase_client import get_client
+
+    client = get_client()
+    if client is None or not image_hash:
+        return None
+
+    try:
+        result = (
+            client.table(TABLE)
+            .select("id, status, image_hash")
+            .eq("image_hash", image_hash)
+            .not_.in_("status", list(_ACTIVE_STATUSES))
+            .limit(1)
+            .execute()
+        )
+        data = result.data
+        if data:
+            return data[0]
+        return None
+    except Exception:
+        logger.warning("lookup_hash_historical failed.", exc_info=True)
+        return None
+
+
+def find_nearby_active_reports(
+    lat: float,
+    lng: float,
+    category: str,
+    radius_m: int = 50,
+) -> list[dict]:
+    """Return active reports within radius_m of (lat, lng) with the given category.
+
+    Uses PostGIS ST_DWithin on the reports.location GEOGRAPHY column.
+    Returns rows ordered by created_at DESC (newest first).
+
+    NOTE: The supabase-py REST client does not expose PostGIS functions directly.
+    We use a raw RPC call to a helper function in the DB, or fall back to
+    returning an empty list if the RPC is not available.  The RPC function
+    `nearby_active_reports` must be created by migration 010.
+    """
+    from db.supabase_client import get_client
+
+    client = get_client()
+    if client is None:
+        return []
+
+    try:
+        result = client.rpc(
+            "nearby_active_reports",
+            {
+                "p_lat": lat,
+                "p_lng": lng,
+                "p_category": category,
+                "p_radius_m": radius_m,
+            },
+        ).execute()
+        return result.data or []
+    except Exception:
+        logger.warning("find_nearby_active_reports RPC failed.", exc_info=True)
+        return []
+
+
+def find_nearby_resolved_reports(
+    lat: float,
+    lng: float,
+    category: str,
+    radius_m: int = 50,
+    window_days: int = 60,
+) -> list[dict]:
+    """Return recently-resolved reports within radius_m of (lat, lng).
+
+    Only reports resolved within the last window_days days are returned.
+    Returns rows ordered by resolved_at DESC (most-recently-resolved first).
+    """
+    from db.supabase_client import get_client
+
+    client = get_client()
+    if client is None:
+        return []
+
+    try:
+        result = client.rpc(
+            "nearby_resolved_reports",
+            {
+                "p_lat": lat,
+                "p_lng": lng,
+                "p_category": category,
+                "p_radius_m": radius_m,
+                "p_window_days": window_days,
+            },
+        ).execute()
+        return result.data or []
+    except Exception:
+        logger.warning("find_nearby_resolved_reports RPC failed.", exc_info=True)
+        return []
+
+
+def insert_report_link(
+    source_report_id: str,
+    target_report_id: str,
+    link_type: str,
+) -> Optional[dict]:
+    """Insert a report_links record.  Returns the inserted row, or None on error.
+
+    link_type must be one of: 'duplicate', 'supporting_evidence', 'reopened'.
+    """
+    from db.supabase_client import get_client
+
+    client = get_client()
+    if client is None:
+        return None
+
+    try:
+        result = (
+            client.table("report_links")
+            .insert({
+                "source_report_id": source_report_id,
+                "target_report_id": target_report_id,
+                "link_type": link_type,
+            })
+            .execute()
+        )
+        data = result.data
+        if data:
+            return data[0]
+        return None
+    except Exception:
+        logger.warning(
+            "insert_report_link failed (source=%s target=%s type=%s).",
+            source_report_id, target_report_id, link_type,
+            exc_info=True,
+        )
+        return None
+
+
+def get_report_links(target_report_id: str) -> list[dict]:
+    """Return all report_links rows where target_report_id matches.
+
+    Used by admin to count and list supporting evidence for a report.
+    """
+    from db.supabase_client import get_client
+
+    client = get_client()
+    if client is None:
+        return []
+
+    try:
+        result = (
+            client.table("report_links")
+            .select("*")
+            .eq("target_report_id", target_report_id)
+            .order("created_at", desc=False)
+            .execute()
+        )
+        return result.data or []
+    except Exception:
+        logger.warning("get_report_links failed.", exc_info=True)
+        return []

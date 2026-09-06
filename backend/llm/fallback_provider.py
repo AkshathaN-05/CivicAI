@@ -5,10 +5,11 @@ Implements a deterministic template engine that produces valid
 calls.  This is the fallback activated when the Groq primary provider is
 unavailable, rate-limited, or returns an invalid schema.
 
-Three use-case templates (architecture Part A §9):
+Four use-case templates (architecture Part A §9):
     1. Complaint description generation
-    2. RTI draft generation  
+    2. RTI draft generation
     3. Ambiguous category classification
+    4. Civic image classification fallback (when Groq vision unavailable)
 
 Public API:
 
@@ -34,6 +35,12 @@ Public API:
         address: str,
     ) -> LLMOutput
 
+    fallback_civic_classify_image(
+        yolo_class: str,
+        all_class_names: tuple,
+        address: str,
+    ) -> CivicClassificationResult
+
 LOCKED decisions (Part A §9):
 - No external API calls — purely deterministic.
 - Output must satisfy the same Pydantic LLMOutput schema as Groq.
@@ -42,6 +49,7 @@ LOCKED decisions (Part A §9):
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 from llm.output_validator import LLMOutput
 from schemas.report import IssueCategory
@@ -324,4 +332,169 @@ def fallback_classify_category(
         description=description,
         authority_recommendation=_authority(cat_value),
         confidence=0.5,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Template: civic image classification fallback (use case 4)
+# ---------------------------------------------------------------------------
+
+# Vision-model category strings → IssueCategory mapping.
+# Maps the extended civic vocabulary from the vision prompt to the canonical
+# IssueCategory enum.  This is used when Groq vision is unavailable and
+# the heuristic fallback must guess from YOLO + address context.
+_VISION_CATEGORY_MAP: dict[str, IssueCategory] = {
+    "pothole":            IssueCategory.pothole,
+    "road_damage":        IssueCategory.road_damage,
+    "broken_road_marking": IssueCategory.road_damage,  # closest existing enum
+    "waterlogging":       IssueCategory.waterlogging,
+    "drainage":           IssueCategory.open_drain,
+    "sewage":             IssueCategory.sewage,
+    "water_leakage":      IssueCategory.water_supply,
+    "garbage":            IssueCategory.garbage_overflow,
+    "streetlight":        IssueCategory.broken_streetlight,
+    "electrical":         IssueCategory.broken_streetlight,
+    "other_civic":        IssueCategory.other,
+    "invalid":            IssueCategory.other,
+}
+
+
+def map_vision_category_to_issue_category(vision_cat: str) -> IssueCategory:
+    """Map a vision-model civic category string to a canonical IssueCategory.
+
+    The vision prompt uses an extended vocabulary (e.g. 'pothole', 'drainage',
+    'water_leakage', 'garbage', 'streetlight') which is a superset of the
+    existing IssueCategory enum values.  This function maps both exact matches
+    and the extended terms to the closest IssueCategory.
+
+    Args:
+        vision_cat: Category string from the vision model or fallback.
+
+    Returns:
+        Matching :class:`~schemas.report.IssueCategory`.
+    """
+    key = vision_cat.strip().lower()
+    # Try exact IssueCategory enum match first
+    try:
+        return IssueCategory(key)
+    except ValueError:
+        pass
+    # Fall back to explicit extended vocabulary mapping
+    return _VISION_CATEGORY_MAP.get(key, IssueCategory.other)
+
+
+def fallback_civic_classify_image(
+    yolo_class: str,
+    all_class_names: tuple,
+    address: str,
+) -> "CivicClassificationResult":
+    """Heuristic civic image classification fallback (no API, no vision model).
+
+    Used when Groq vision is unavailable.  Applies the same keyword-matching
+    logic as fallback_classify_category but returns a CivicClassificationResult
+    instead of LLMOutput.
+
+    The heuristic logic:
+    1. Check all YOLO class names for known civic-context objects.
+    2. Fall back to address keyword matching.
+    3. If neither matches, return category='other_civic', valid=True, low confidence.
+       (We assume the image passed YOLO-based validation already, so it is
+       likely civic unless YOLO specifically flagged a person-dominant scene.)
+
+    Args:
+        yolo_class:      Top-1 YOLO class name.
+        all_class_names: All YOLO-detected class names (tuple).
+        address:         Free-text address/location string.
+
+    Returns:
+        :class:`CivicClassificationResult`.
+    """
+    # Deferred import to avoid circular dependency
+    from llm.groq_provider import CivicClassificationResult
+
+    obj_str = " ".join(str(n).lower() for n in all_class_names) + " " + yolo_class.lower()
+    addr_lower = address.lower()
+
+    # Pass 1: check YOLO classes for civic context objects
+    _OBJ_KEYWORD_MAP: list[tuple[str, str, str, float]] = [
+        # (keyword, vision_cat, severity, severity_score)
+        ("car",          "road_damage",  "medium", 0.5),
+        ("truck",        "road_damage",  "medium", 0.5),
+        ("motorcycle",   "road_damage",  "medium", 0.5),
+        ("bicycle",      "road_damage",  "low",    0.3),
+        ("bus",          "road_damage",  "medium", 0.5),
+        ("stop sign",    "road_damage",  "low",    0.3),
+        ("traffic light","streetlight",  "medium", 0.5),
+        ("fire hydrant", "streetlight",  "medium", 0.5),
+        ("toilet",       "sewage",       "high",   0.85),
+        ("sink",         "water_leakage","medium", 0.5),
+        ("boat",         "waterlogging", "high",   0.85),
+        ("bottle",       "garbage",      "medium", 0.5),
+        ("cup",          "garbage",      "medium", 0.5),
+        ("bowl",         "garbage",      "medium", 0.5),
+    ]
+
+    matched_cat = None
+    matched_severity = "low"
+    matched_sev_score = 0.3
+
+    for keyword, vision_cat, sev, sev_score in _OBJ_KEYWORD_MAP:
+        if keyword in obj_str:
+            matched_cat = vision_cat
+            matched_severity = sev
+            matched_sev_score = sev_score
+            break
+
+    # Pass 2: address keyword matching
+    if matched_cat is None:
+        _ADDR_KEYWORD_MAP: list[tuple[str, str, str, float]] = [
+            ("pothole",     "pothole",      "medium", 0.5),
+            ("pot hole",    "pothole",      "medium", 0.5),
+            ("waterlog",    "waterlogging", "high",   0.85),
+            ("flood",       "waterlogging", "high",   0.85),
+            ("drain",       "drainage",     "medium", 0.5),
+            ("sewage",      "sewage",       "high",   0.85),
+            ("sewer",       "sewage",       "high",   0.85),
+            ("streetlight", "streetlight",  "medium", 0.5),
+            ("street light","streetlight",  "medium", 0.5),
+            ("garbage",     "garbage",      "medium", 0.5),
+            ("waste",       "garbage",      "medium", 0.5),
+            ("litter",      "garbage",      "low",    0.3),
+            ("water pipe",  "water_leakage","medium", 0.5),
+            ("water supply","water_leakage","medium", 0.5),
+            ("road damage", "road_damage",  "medium", 0.5),
+            ("road",        "road_damage",  "low",    0.3),
+        ]
+        for keyword, vision_cat, sev, sev_score in _ADDR_KEYWORD_MAP:
+            if keyword in addr_lower:
+                matched_cat = vision_cat
+                matched_severity = sev
+                matched_sev_score = sev_score
+                break
+
+    if matched_cat is None:
+        # No recognizable civic context — mark as other_civic with low confidence
+        # (the image already passed the YOLO relevance gate so it is likely civic)
+        matched_cat = "other_civic"
+        matched_severity = "low"
+        matched_sev_score = 0.2
+
+    description = (
+        f"A potential {_label(map_vision_category_to_issue_category(matched_cat).value)} "
+        f"issue has been reported at {address}. "
+        "Please inspect and take appropriate action."
+    )[:500]
+
+    logger.debug(
+        "fallback_civic_classify_image: yolo=%r address=%r → category=%s",
+        yolo_class, address, matched_cat,
+    )
+    return CivicClassificationResult(
+        valid=True,
+        category=matched_cat,
+        category_confidence=0.45,  # heuristic fallback — moderate confidence
+        severity=matched_severity,
+        severity_score=matched_sev_score,
+        description=description,
+        reason="heuristic_fallback",
     )

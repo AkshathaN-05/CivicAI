@@ -197,16 +197,19 @@ async def create_report_from_image(
     lng: Optional[float] = None,
     address: str = "",
     user_id: Optional[str] = None,
+    gps_accuracy: Optional[float] = None,
 ) -> ReportOut:
     """Create a new report from raw image bytes via the full AI pipeline (T3-3).
 
     This is the primary T3-3 entry point:
       1. Run cv/pipeline.run_ai_pipeline() — validates image, redacts, hashes,
          detects, scores confidence, routes authority, generates LLM description.
+         Evidence decision engine is wired in via DB callbacks.
       2. Upload original image to report-originals bucket via storage_service.
       3. Upload redacted image to report-redacted bucket via storage_service.
-      4. Insert DB row with all AI results.
-      5. Return ReportOut with signed URLs and AI fields.
+      4. Insert DB row with all AI results + evidence fields.
+      5. If DUPLICATE or REOPENED: insert report_links record.
+      6. Return ReportOut with signed URLs and AI fields.
 
     Args:
         image_bytes:  Raw uploaded image bytes.
@@ -215,6 +218,7 @@ async def create_report_from_image(
         lng:          GPS longitude from browser geolocation (optional).
         address:      Human-readable area text / address for LLM prompts.
         user_id:      Authenticated user's JWT sub.
+        gps_accuracy: GPS accuracy radius in metres (optional).
 
     Returns:
         ReportOut with all AI results and signed image URLs.
@@ -223,14 +227,14 @@ async def create_report_from_image(
         cv.image_validator.ImageValidationError: when image fails T2-2 validation.
     """
     from cv.pipeline import run_ai_pipeline
+    from datetime import datetime as _dt, timezone as _tz
 
     # Build location string for the pipeline (Part A §23).
     location = ""
     if lat is not None and lng is not None:
         location = f"{lat},{lng}"
 
-    # Fetch existing image hashes from DB for duplicate detection (T2-7).
-    # This is a best-effort query; failure is non-blocking.
+    # Fetch existing image hashes from DB for backward-compat advisory check.
     existing_hashes: list = []
     if _supabase_enabled():
         try:
@@ -245,6 +249,69 @@ async def create_report_from_image(
         except Exception:
             logger.warning("create_report_from_image: could not fetch existing hashes.", exc_info=True)
 
+    # Build decision-engine DB callbacks (only when Supabase is enabled)
+    _lookup_hash_active = None
+    _lookup_hash_historical = None
+    _find_nearby_active = None
+    _find_nearby_resolved = None
+
+    if _supabase_enabled():
+        from db.repositories import report_repo as _rr
+        from cv.decision_engine import NearbyActiveReport, NearbyResolvedReport, HashLookupResult
+
+        def _lookup_hash_active(h: str):
+            row = _rr.lookup_hash_active(h)
+            if row:
+                return HashLookupResult(found=True, report_id=str(row["id"]), status=row.get("status"))
+            return HashLookupResult(found=False)
+
+        def _lookup_hash_historical(h: str):
+            row = _rr.lookup_hash_historical(h)
+            if row:
+                return HashLookupResult(found=True, report_id=str(row["id"]), status=row.get("status"))
+            return HashLookupResult(found=False)
+
+        def _find_nearby_active(la: float, ln: float, cat: str, radius: int):
+            rows = _rr.find_nearby_active_reports(la, ln, cat, radius)
+            results = []
+            for r in rows:
+                try:
+                    created = r.get("created_at")
+                    if isinstance(created, str):
+                        from datetime import datetime as __dt
+                        created = __dt.fromisoformat(created.replace("Z", "+00:00"))
+                    results.append(NearbyActiveReport(
+                        report_id=str(r["report_id"]),
+                        created_at=created,
+                        status=r.get("status", "SUBMITTED"),
+                        distance_metres=r.get("distance_metres"),
+                    ))
+                except Exception:
+                    pass
+            return results
+
+        def _find_nearby_resolved(la: float, ln: float, cat: str, radius: int, days: int):
+            rows = _rr.find_nearby_resolved_reports(la, ln, cat, radius, days)
+            results = []
+            for r in rows:
+                try:
+                    resolved = r.get("resolved_at")
+                    if isinstance(resolved, str):
+                        from datetime import datetime as __dt
+                        resolved = __dt.fromisoformat(resolved.replace("Z", "+00:00"))
+                    if resolved is None:
+                        continue
+                    results.append(NearbyResolvedReport(
+                        report_id=str(r["report_id"]),
+                        resolved_at=resolved,
+                        distance_metres=r.get("distance_metres"),
+                    ))
+                except Exception:
+                    pass
+            return results
+
+    submission_ts = _dt.now(_tz.utc)
+
     # Run AI pipeline (T2-11) — may raise ImageValidationError.
     ai_result = await run_ai_pipeline(
         image_bytes=image_bytes,
@@ -252,6 +319,12 @@ async def create_report_from_image(
         address=address or location or "Mangaluru",
         claimed_mime=claimed_mime,
         existing_hashes=existing_hashes,
+        gps_accuracy=gps_accuracy,
+        submission_timestamp=submission_ts,
+        lookup_hash_active=_lookup_hash_active,
+        lookup_hash_historical=_lookup_hash_historical,
+        find_nearby_active=_find_nearby_active,
+        find_nearby_resolved=_find_nearby_resolved,
     )
 
     report_id = str(uuid.uuid4())
@@ -300,6 +373,16 @@ async def create_report_from_image(
         # Signed URLs will be attached below.
         image_original_url=None,
         image_redacted_url=None,
+        # Evidence verification fields
+        decision_state=ai_result.decision_state,
+        evidence_score=ai_result.evidence_score,
+        admin_priority=ai_result.admin_priority,
+        severity=ai_result.severity,
+        is_reopened=ai_result.is_reopened,
+        linked_report_id=ai_result.linked_report_id,
+        image_reuse_flag=ai_result.image_reuse_flag,
+        citizen_message=ai_result.citizen_message,
+        # evidence_breakdown is admin-only; not included in citizen-facing ReportOut
     )
 
     # Write to in-memory store first — guarantees response even if DB fails.
@@ -333,6 +416,19 @@ async def create_report_from_image(
                     "image_original_path": original_path,
                     "image_redacted_path": redacted_path,
                     "image_hash": ai_result.image_hash or None,
+                    # Evidence fields stored as dedicated columns
+                    "decision_state": ai_result.decision_state,
+                    "evidence_score": ai_result.evidence_score,
+                    "admin_priority": ai_result.admin_priority,
+                    "visual_confidence": ai_result.visual_confidence,
+                    "category_confidence": ai_result.category_confidence,
+                    "location_confidence": ai_result.location_confidence,
+                    "freshness_confidence": ai_result.freshness_confidence,
+                    "severity": ai_result.severity,
+                    "is_reopened": ai_result.is_reopened,
+                    "linked_report_id": ai_result.linked_report_id,
+                    "image_reuse_flag": ai_result.image_reuse_flag,
+                    "gps_accuracy_metres": gps_accuracy,
                     "ai_raw_response": {
                         "description": ai_result.description,
                         "match_reason": ai_result.match_reason,
@@ -340,12 +436,50 @@ async def create_report_from_image(
                         "duplicate_report_id": ai_result.duplicate_report_id,
                         "llm_provider_used": ai_result.llm_provider_used,
                         "yolo_class": ai_result.yolo_class,
+                        # Full evidence breakdown stored in JSONB for admin explainability
+                        "evidence_breakdown": ai_result.evidence_breakdown,
                     },
                 }
                 inserted = report_repo.insert_report(row)
                 if inserted:
+                    # Insert report_links record if DUPLICATE or REOPENED
+                    _link_type = None
+                    if ai_result.decision_state == "duplicate_active_report":
+                        _link_type = (
+                            "duplicate"
+                            if (ai_result.evidence_breakdown or {}).get("hash_match_type") == "exact_active"
+                            else "supporting_evidence"
+                        )
+                    elif ai_result.decision_state == "possible_reopened_issue":
+                        _link_type = "reopened"
+
+                    if _link_type and ai_result.linked_report_id:
+                        try:
+                            report_repo.insert_report_link(
+                                source_report_id=report_id,
+                                target_report_id=ai_result.linked_report_id,
+                                link_type=_link_type,
+                            )
+                        except Exception:
+                            logger.warning(
+                                "create_report_from_image: insert_report_link failed "
+                                "(non-blocking).",
+                                exc_info=True,
+                            )
+
                     db_report = _row_to_report_out(inserted)
                     if db_report:
+                        # Attach evidence fields that _row_to_report_out doesn't yet handle
+                        db_report = db_report.model_copy(update={
+                            "decision_state": ai_result.decision_state,
+                            "evidence_score": ai_result.evidence_score,
+                            "admin_priority": ai_result.admin_priority,
+                            "severity": ai_result.severity,
+                            "is_reopened": ai_result.is_reopened,
+                            "linked_report_id": ai_result.linked_report_id,
+                            "image_reuse_flag": ai_result.image_reuse_flag,
+                            "citizen_message": ai_result.citizen_message,
+                        })
                         # Attach paths for signed URL generation.
                         db_report = _attach_signed_urls(
                             db_report,
