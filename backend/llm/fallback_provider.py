@@ -340,46 +340,123 @@ def fallback_classify_category(
 # ---------------------------------------------------------------------------
 
 # Vision-model category strings → IssueCategory mapping.
-# Maps the extended civic vocabulary from the vision prompt to the canonical
-# IssueCategory enum.  This is used when Groq vision is unavailable and
-# the heuristic fallback must guess from YOLO + address context.
+# Maps the new 4-bucket AI vocabulary AND legacy extended vocabulary to the
+# canonical IssueCategory enum.
+#
+# New AI buckets:
+#   pothole       → IssueCategory.pothole
+#   road_damage   → IssueCategory.road_damage
+#   streetlight   → IssueCategory.broken_streetlight
+#   water_sewage  → IssueCategory.water_supply  (default; caller may refine via reason)
+#   other         → IssueCategory.other
+#   invalid       → IssueCategory.other
+#
+# Legacy categories (still accepted for backward compat):
+#   waterlogging, sewage, water_leakage, drainage, garbage, electrical, etc.
 _VISION_CATEGORY_MAP: dict[str, IssueCategory] = {
-    "pothole":            IssueCategory.pothole,
-    "road_damage":        IssueCategory.road_damage,
-    "broken_road_marking": IssueCategory.road_damage,  # closest existing enum
-    "waterlogging":       IssueCategory.waterlogging,
-    "drainage":           IssueCategory.open_drain,
-    "sewage":             IssueCategory.sewage,
-    "water_leakage":      IssueCategory.water_supply,
-    "garbage":            IssueCategory.garbage_overflow,
-    "streetlight":        IssueCategory.broken_streetlight,
-    "electrical":         IssueCategory.broken_streetlight,
-    "other_civic":        IssueCategory.other,
-    "invalid":            IssueCategory.other,
+    # DB enum values returned directly by the new prompt (pass-through)
+    "pothole":               IssueCategory.pothole,
+    "road_damage":           IssueCategory.road_damage,
+    "broken_streetlight":    IssueCategory.broken_streetlight,
+    "garbage_overflow":      IssueCategory.garbage_overflow,
+    "open_drain":            IssueCategory.open_drain,
+    "illegal_construction":  IssueCategory.illegal_construction,
+    "waterlogging":          IssueCategory.waterlogging,
+    "water_supply":          IssueCategory.water_supply,
+    "sewage":                IssueCategory.sewage,
+    "other":                 IssueCategory.other,
+    "invalid":               IssueCategory.other,
+    # Internal water_sewage bucket — resolved via reason; default = water_supply
+    "water_sewage":          IssueCategory.water_supply,
+    # Legacy short-form keys (old prompt format — kept for backward compat)
+    "streetlight":           IssueCategory.broken_streetlight,
+    "garbage":               IssueCategory.garbage_overflow,
+    "electrical":            IssueCategory.broken_streetlight,
+    "drainage":              IssueCategory.open_drain,
+    "water_leakage":         IssueCategory.water_supply,
+    "broken_road_marking":   IssueCategory.road_damage,
+    "other_civic":           IssueCategory.other,
+}
+
+# Mapping from water_sewage subtype keywords in the 'reason' field to IssueCategory.
+# When category=water_sewage, the 'reason' field contains the subtype
+# (water_leakage, sewage, or waterlogging) to allow correct DB mapping.
+_WATER_SEWAGE_REASON_MAP: dict[str, IssueCategory] = {
+    "water_leakage": IssueCategory.water_supply,
+    "water leakage": IssueCategory.water_supply,
+    "leaking pipe":  IssueCategory.water_supply,
+    "pipe":          IssueCategory.water_supply,
+    "burst":         IssueCategory.water_supply,
+    "sewage":        IssueCategory.sewage,
+    "sewer":         IssueCategory.sewage,
+    "wastewater":    IssueCategory.sewage,
+    "waterlogging":  IssueCategory.waterlogging,
+    "flooding":      IssueCategory.waterlogging,
+    "standing water": IssueCategory.waterlogging,
+    "flood":         IssueCategory.waterlogging,
 }
 
 
-def map_vision_category_to_issue_category(vision_cat: str) -> IssueCategory:
+def _map_water_sewage_reason(reason: str) -> IssueCategory:
+    """Refine water_sewage category by scanning the reason field for subtype keywords.
+
+    Args:
+        reason: The 'reason' string from CivicClassificationResult.
+
+    Returns:
+        The most specific IssueCategory for the water/sewage problem,
+        defaulting to IssueCategory.water_supply if no subtype keyword found.
+    """
+    reason_lower = reason.strip().lower()
+    for keyword, category in _WATER_SEWAGE_REASON_MAP.items():
+        if keyword in reason_lower:
+            return category
+    # Default: water_supply is the safest generic water mapping
+    return IssueCategory.water_supply
+
+
+def map_vision_category_to_issue_category(
+    vision_cat: str,
+    reason: str = "",
+) -> IssueCategory:
     """Map a vision-model civic category string to a canonical IssueCategory.
 
-    The vision prompt uses an extended vocabulary (e.g. 'pothole', 'drainage',
-    'water_leakage', 'garbage', 'streetlight') which is a superset of the
-    existing IssueCategory enum values.  This function maps both exact matches
-    and the extended terms to the closest IssueCategory.
+    Resolution order:
+    1. Synonym normalisation via _normalise_category (handles legacy short
+       forms, free-text variants, and the new DB-direct enum values).
+    2. water_sewage is refined via the reason subtype field.
+    3. Try IssueCategory(key) — exact DB enum match (new prompt returns these
+       directly: broken_streetlight, garbage_overflow, open_drain, etc.).
+    4. Fall back to _VISION_CATEGORY_MAP for any remaining legacy keys.
+    5. Last resort: IssueCategory.other.
 
     Args:
         vision_cat: Category string from the vision model or fallback.
+        reason:     Optional reason/subtype string (used for water_sewage mapping).
 
     Returns:
         Matching :class:`~schemas.report.IssueCategory`.
     """
-    key = vision_cat.strip().lower()
-    # Try exact IssueCategory enum match first
+    # Apply synonym normalisation first (imported lazily to avoid circular dep)
+    try:
+        from llm.groq_provider import _normalise_category
+        key = _normalise_category(vision_cat)
+    except Exception:
+        key = vision_cat.strip().lower()
+
+    # Special handling for water_sewage — refine via reason subtype
+    if key == "water_sewage":
+        return _map_water_sewage_reason(reason)
+
+    # Try exact IssueCategory enum match first.
+    # The new prompt returns DB enum values directly ("broken_streetlight",
+    # "garbage_overflow", etc.) so this succeeds on the first try for all
+    # primary categories.
     try:
         return IssueCategory(key)
     except ValueError:
         pass
-    # Fall back to explicit extended vocabulary mapping
+    # Fall back to explicit extended vocabulary mapping (legacy keys)
     return _VISION_CATEGORY_MAP.get(key, IssueCategory.other)
 
 
@@ -473,9 +550,9 @@ def fallback_civic_classify_image(
                 break
 
     if matched_cat is None:
-        # No recognizable civic context — mark as other_civic with low confidence
+        # No recognizable civic context — mark as "other" with low confidence
         # (the image already passed the YOLO relevance gate so it is likely civic)
-        matched_cat = "other_civic"
+        matched_cat = "other"
         matched_severity = "low"
         matched_sev_score = 0.2
 

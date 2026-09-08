@@ -1,10 +1,17 @@
 """Authority routing service — ADR-001 (LOCKED).
 
 Routing logic:
-  1. Filter authorities whose `categories` array includes the issue category.
-  2. If area_text provided: substring-match (case-insensitive) against each
-     authority's area_text field.  Return best match.
-  3. Fallback: first category-matching authority.
+  1. Filter authorities whose ``categories`` array includes the issue category.
+  2. If area_text provided: keyword-score each candidate against its area_text.
+     Return the highest-scoring authority when the score is > 0.
+  3. Specialist tie-break (no geographic match): among the remaining candidates
+     prefer the authority whose category list is **most specific** to the
+     requested category — i.e. the one with the fewest total supported categories.
+     A specialist authority (e.g. MESCOM: 1 category) outranks a generic
+     municipal authority (e.g. MCC: 7 categories) when both are geographically
+     plausible but neither has a keyword advantage.
+     Tie within equal specificity: preserve original JSON order (stable sort).
+  4. Last resort: first category-matching authority.
 
 Forbidden: ward numbers, ward ranges, GeoJSON, PostGIS polygon containment.
 Source: backend/data/mangaluru_authorities.json — IMMUTABLE, loaded once.
@@ -33,6 +40,18 @@ def _keyword_score(area_text: str, authority_area: str) -> int:
     return sum(1 for w in words if w in target)
 
 
+def _specialist_rank(authority: dict) -> int:
+    """Return the number of categories the authority supports.
+
+    An authority with rank == 1 is a singleton specialist (handles exactly one
+    civic category) and is preferred over generic multi-category authorities
+    when geographic keyword matching produces no distinguishing signal.
+
+    This is fully data-driven: no authority name is hard-coded here.
+    """
+    return len(authority.get("categories", []))
+
+
 def route_to_authority(
     category: str,
     area_text: Optional[str] = None,
@@ -41,7 +60,8 @@ def route_to_authority(
 
     Confidence values:
       1.0 — keyword match in area_text
-      0.7 — category-only fallback
+      0.8 — specialist authority selected by category specificity
+      0.7 — generic category fallback (first match, equal specificity)
       0.0 — no matching authority
     """
     authorities = _load_authorities()
@@ -65,7 +85,29 @@ def route_to_authority(
             )
             return best_authority, reason, 1.0
 
-    # Step 3: category fallback
+    # Step 3: singleton-specialist tie-break.
+    # If any candidate authority handles ONLY this single civic category
+    # (i.e. its categories list has exactly one entry), it is a dedicated
+    # single-purpose authority and should be preferred over generic multi-category
+    # authorities regardless of JSON ordering.
+    #
+    # Using a threshold of 1 (singleton) keeps this rule narrow and safe:
+    # - MESCOM (1 category: broken_streetlight) → selected for broken_streetlight ✓
+    # - MWWD   (2 categories: water_supply+sewage) → not promoted over itself ✓
+    # - NHAI   (2 categories: pothole+road_damage) → not promoted for generic potholes ✓
+    # - MCC    (7 categories) → never promoted by this rule ✓
+    #
+    # No authority name is hard-coded; the rule is fully data-driven.
+    singleton_specialists = [a for a in category_matches if _specialist_rank(a) == 1]
+    if singleton_specialists:
+        specialist = singleton_specialists[0]  # take the first (stable order)
+        reason = (
+            f"Specialist authority: {specialist['short_name']} is the sole dedicated "
+            f"authority for '{category}' issues in Mangaluru."
+        )
+        return specialist, reason, 0.8
+
+    # Step 4: generic fallback — no singleton specialist; keep first JSON-order match.
     fallback = category_matches[0]
     reason = (
         f"Category default: {fallback['short_name']} handles "

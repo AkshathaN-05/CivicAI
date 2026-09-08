@@ -223,7 +223,7 @@ class TestRunAIPipeline:
         # (low confidence or category=other). Returns a simple valid civic result.
         from llm.groq_provider import CivicClassificationResult
 
-        async def _fake_civic_classify(image_bytes, yolo_class, all_class_names, address):
+        async def _fake_civic_classify(image_bytes, yolo_class, all_class_names, address, *, road_model_hint=""):
             return CivicClassificationResult(
                 valid=True,
                 category=detection_category.value,
@@ -234,10 +234,18 @@ class TestRunAIPipeline:
                 reason="mocked",
             )
 
+        from cv.road_damage import RoadDamageResult as _RDR
+
+        def _fake_road(_img):
+            # Return not-detected so road model fast-path is never taken in these
+            # basic pipeline tests (they exercise non-road paths via _fake_civic_classify).
+            return _RDR(detected=False, category="", confidence=0.0)
+
         with (
             patch("cv.pipeline.validate_image", wraps=__import__("cv.image_validator", fromlist=["validate_image"]).validate_image),
             patch("cv.detection.detect_civic_issue", side_effect=_fake_detect),
             patch("cv.privacy.redact_privacy", side_effect=_fake_redact_privacy),
+            patch("cv.road_damage.classify_road_damage", side_effect=_fake_road),
             patch("services.llm_service.generate_complaint_description", new=_fake_gen_description),
             patch("services.llm_service.classify_category", new=_fake_classify),
             patch("services.llm_service.civic_classify_image", new=_fake_civic_classify),
@@ -302,10 +310,59 @@ class TestRunAIPipeline:
         assert len(result.redacted_image_bytes) > 0
 
     async def test_llm_failure_description_is_empty(self):
-        """When LLM fails description is empty string (pipeline still succeeds)."""
-        result = await self._run_with_mocks(
-            llm_side_effect=RuntimeError("LLM failed")
-        )
+        """When generate_complaint_description fails, description is empty and
+        the pipeline still succeeds.
+
+        Vision classification runs first. If vision returns an empty description
+        the pipeline falls through to generate_complaint_description; when that
+        fails too the final description is "".
+        """
+        # Use a civic_classify mock that returns NO description so the pipeline
+        # falls through to generate_complaint_description (which will fail).
+        from llm.groq_provider import CivicClassificationResult as _CCR
+        from cv.road_damage import RoadDamageResult as _RDR
+
+        async def _civic_no_desc(image_bytes, yolo_class, all_class_names, address):
+            return _CCR(
+                valid=True,
+                category="road_damage",
+                category_confidence=0.8,
+                severity="medium",
+                severity_score=0.5,
+                description="",   # no description → falls through to LLM
+                reason="mocked",
+            )
+
+        def _fake_detect(img):
+            from unittest.mock import MagicMock as _MM
+            m = _MM()
+            m.yolo_class = "car"
+            m.confidence = 0.8
+            m.category = IssueCategory.road_damage
+            m.all_class_names = ("car",)
+            return m
+
+        def _fake_road(_img):
+            return _RDR(detected=False, category="", confidence=0.0)
+
+        async def _failing_gen(cv_result, location, address):
+            raise RuntimeError("LLM failed")
+
+        async def _fake_classify(image_context):
+            return IssueCategory.road_damage
+
+        with (
+            patch("cv.detection.detect_civic_issue", side_effect=_fake_detect),
+            patch("cv.privacy.redact_privacy", side_effect=lambda img: img),
+            patch("cv.road_damage.classify_road_damage", side_effect=_fake_road),
+            patch("services.llm_service.civic_classify_image", new=_civic_no_desc),
+            patch("services.llm_service.classify_category", new=_fake_classify),
+            patch("services.llm_service.generate_complaint_description", new=_failing_gen),
+        ):
+            result = await run_ai_pipeline(
+                VALID_JPEG, location="13.0,74.0", address="MG Road, Mangaluru"
+            )
+
         assert isinstance(result, AIResult)
         assert result.description == ""
 
@@ -368,17 +425,17 @@ class TestRunAIPipeline:
         assert len(result.authority_recommendation) > 0
 
     async def test_low_confidence_calls_civic_classify_image(self):
-        """When YOLO confidence < 0.5, civic_classify_image (vision) is called.
+        """Low-confidence YOLO → road model runs (not confident) → Groq Vision called.
 
-        Updated behavior: the pipeline now uses vision-based civic classification
-        (civic_classify_image) instead of classify_category for low-confidence
-        YOLO detections.  This is the core fix for the pothole misclassification bug.
+        The road model returns detected=False, so the pipeline always routes
+        non-road-confident images to Groq Vision (civic_classify_image).
         """
-        vision_called = []
-
+        from cv.road_damage import RoadDamageResult
         from llm.groq_provider import CivicClassificationResult
 
-        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address):
+        vision_called = []
+
+        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address, *, road_model_hint=""):
             vision_called.append({"yolo_class": yolo_class, "address": address})
             return CivicClassificationResult(
                 valid=True, category="garbage",
@@ -394,14 +451,18 @@ class TestRunAIPipeline:
         def _fake_detect(img):
             m = MagicMock()
             m.yolo_class = "bottle"
-            m.confidence = 0.3  # below 0.5 threshold
+            m.confidence = 0.3
             m.category = IssueCategory.garbage_overflow
             m.all_class_names = ("bottle",)
             return m
 
+        def _fake_road(_img):
+            return RoadDamageResult(detected=False, category="", confidence=0.0)
+
         with (
             patch("cv.detection.detect_civic_issue", side_effect=_fake_detect),
             patch("cv.privacy.redact_privacy", side_effect=lambda img: img),
+            patch("cv.road_damage.classify_road_damage", side_effect=_fake_road),
             patch("services.llm_service.civic_classify_image", new=_tracking_vision),
             patch("services.llm_service.generate_complaint_description", new=_fake_gen_description),
         ):
@@ -413,16 +474,27 @@ class TestRunAIPipeline:
             "civic_classify_image (vision) should have been called for low confidence"
         )
 
-    async def test_high_confidence_non_other_skips_civic_classify_image(self):
-        """When YOLO confidence >= 0.5 AND category != other, civic_classify_image
-        is NOT called; classify_category is used instead (existing flow).
-        """
-        vision_called = []
+    async def test_groq_vision_always_called_regardless_of_road_model_confidence(self):
+        """New routing: Groq Vision (civic_classify_image) is ALWAYS called for every image.
 
+        Under the new spec, Groq Vision is the final semantic authority.  The road
+        model provides only a hint.  Both when the road model IS confident and when
+        it is NOT confident, civic_classify_image is called.
+
+        This tests:
+        - Case 1: road model IS confident → Vision is STILL called (road hint passed)
+        - Case 2: road model is NOT confident → Vision is called (no hint)
+        """
+        from cv.road_damage import RoadDamageResult
         from llm.groq_provider import CivicClassificationResult
 
-        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address):
-            vision_called.append(True)
+        # ---- Case 1: road model IS confident → Vision is STILL called with hint ----
+        vision_calls_confident = []
+        hints_confident = []
+
+        async def _tracking_vision_c(image_bytes, yolo_class, all_class_names, address, *, road_model_hint=""):
+            vision_calls_confident.append(True)
+            hints_confident.append(road_model_hint)
             return CivicClassificationResult(
                 valid=True, category="road_damage",
                 category_confidence=0.9,
@@ -440,23 +512,65 @@ class TestRunAIPipeline:
         def _fake_detect(img):
             m = MagicMock()
             m.yolo_class = "car"
-            m.confidence = 0.8  # >= 0.5 AND category != other
+            m.confidence = 0.8
             m.category = IssueCategory.road_damage
             m.all_class_names = ("car",)
             return m
 
+        def _fake_road_confident(_img):
+            return RoadDamageResult(detected=True, category="road_damage", confidence=0.85)
+
         with (
             patch("cv.detection.detect_civic_issue", side_effect=_fake_detect),
             patch("cv.privacy.redact_privacy", side_effect=lambda img: img),
-            patch("services.llm_service.civic_classify_image", new=_tracking_vision),
+            patch("cv.road_damage.classify_road_damage", side_effect=_fake_road_confident),
+            patch("services.llm_service.civic_classify_image", new=_tracking_vision_c),
             patch("services.llm_service.classify_category", new=_fake_classify_cat),
             patch("services.llm_service.generate_complaint_description", new=_fake_gen),
         ):
-            result = await run_ai_pipeline(VALID_JPEG, location="", address="Mangaluru")
+            await run_ai_pipeline(VALID_JPEG, location="", address="Mangaluru")
 
-        assert not vision_called, (
-            "civic_classify_image should NOT be called when YOLO conf >= 0.5 "
-            "and category != other"
+        assert vision_calls_confident, (
+            "civic_classify_image MUST be called even when road model is confident — "
+            "Groq Vision is always the final semantic authority"
+        )
+        assert hints_confident and hints_confident[0] != "", (
+            "Road model hint must be passed to Vision when road model is confident"
+        )
+
+        # ---- Case 2: road model is NOT confident + high YOLO → vision IS called (no hint) ----
+        vision_calls_not_confident = []
+        hints_not_confident = []
+
+        async def _tracking_vision_nc(image_bytes, yolo_class, all_class_names, address, *, road_model_hint=""):
+            vision_calls_not_confident.append(True)
+            hints_not_confident.append(road_model_hint)
+            return CivicClassificationResult(
+                valid=True, category="road_damage",
+                category_confidence=0.9,
+                severity="medium", severity_score=0.5,
+                description="Road damage visible.",
+                reason="road_detected",
+            )
+
+        def _fake_road_not_confident(_img):
+            return RoadDamageResult(detected=False, category="", confidence=0.1)
+
+        with (
+            patch("cv.detection.detect_civic_issue", side_effect=_fake_detect),
+            patch("cv.privacy.redact_privacy", side_effect=lambda img: img),
+            patch("cv.road_damage.classify_road_damage", side_effect=_fake_road_not_confident),
+            patch("services.llm_service.civic_classify_image", new=_tracking_vision_nc),
+            patch("services.llm_service.classify_category", new=_fake_classify_cat),
+            patch("services.llm_service.generate_complaint_description", new=_fake_gen),
+        ):
+            await run_ai_pipeline(VALID_JPEG, location="", address="Mangaluru")
+
+        assert vision_calls_not_confident, (
+            "civic_classify_image MUST be called when road model is not confident"
+        )
+        assert hints_not_confident and hints_not_confident[0] == "", (
+            "No hint should be passed to Vision when road model is not confident"
         )
 
     async def test_no_db_writes(self):
@@ -559,7 +673,7 @@ class TestRoadModelIntegration:
                 raise road_side_effect
             return road_result
 
-        async def _fake_vision(image_bytes, yolo_class, all_class_names, address):
+        async def _fake_vision(image_bytes, yolo_class, all_class_names, address, *, road_model_hint=""):
             if vision_side_effect is not None:
                 raise vision_side_effect
             return vision_result
@@ -606,16 +720,24 @@ class TestRoadModelIntegration:
     # ------------------------------------------------------------------
 
     async def test_A_confident_pothole_uses_local_result(self):
-        """A. Confident pothole detection: local result accepted, vision NOT called."""
+        """A. Road model confident pothole: hint passed to Groq Vision; Vision is ALWAYS called.
+
+        Under the new routing, the road model result is a HINT — Groq Vision is
+        always the final semantic authority.  The hint is passed as road_model_hint
+        and Vision still makes the final call.  When Vision agrees with the hint,
+        the result is pothole.
+        """
         from cv.road_damage import RoadDamageResult
         from schemas.report import IssueCategory
 
         road_result = RoadDamageResult(detected=True, category="pothole",
                                        confidence=0.82, raw_class="D40")
         vision_calls = []
+        hints_received = []
 
-        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address):
+        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address, *, road_model_hint=""):
             vision_calls.append(True)
+            hints_received.append(road_model_hint)
             v = MagicMock()
             v.valid = True; v.category = "pothole"; v.category_confidence = 0.9
             v.severity = "high"; v.severity_score = 0.85
@@ -637,7 +759,7 @@ class TestRoadModelIntegration:
             from llm.output_validator import LLMOutput
             return LLMOutput(category=IssueCategory.pothole,
                              description="desc", authority_recommendation="MCC",
-                             confidence=0.82)
+                             confidence=0.9)
 
         async def _fake_classify_cat(ctx):
             return IssueCategory.road_damage
@@ -657,11 +779,22 @@ class TestRoadModelIntegration:
         assert result.category == IssueCategory.pothole, (
             f"Expected pothole, got {result.category}"
         )
-        assert result.confidence == pytest.approx(0.82, abs=1e-6)
-        assert not vision_calls, "civic_classify_image must NOT be called when road model is confident"
+        # Groq Vision is ALWAYS called — road model result is hint-only
+        assert vision_calls, "civic_classify_image MUST be called; road model is hint-only"
+        # Road model hint must be forwarded to Vision
+        assert hints_received and ("pothole" in hints_received[0].lower() or "d40" in hints_received[0].lower()), (
+            f"Road model hint should mention pothole/D40, got: {hints_received[0]!r}"
+        )
+        # Final confidence comes from Vision model
+        assert result.confidence == pytest.approx(0.9, abs=1e-6)
 
     async def test_A_confident_road_damage_uses_local_result(self):
-        """A. Confident road_damage (D00 crack): local result accepted, vision skipped."""
+        """A. Road model confident road_damage: hint passed to Groq Vision; Vision always called.
+
+        Under the new routing, the road model hint is passed to Groq Vision
+        which makes the final semantic decision.  The default _run vision mock
+        returns road_damage, so the final category is road_damage.
+        """
         from cv.road_damage import RoadDamageResult
         from schemas.report import IssueCategory
 
@@ -670,8 +803,8 @@ class TestRoadModelIntegration:
         result = await self._run(road_result=road_result)
 
         assert result.category == IssueCategory.road_damage
-        assert result.confidence == pytest.approx(0.71, abs=1e-6)
-        assert result.llm_provider_used == "local_road_model"
+        # Confidence now comes from Vision model (0.75 from the default mock)
+        assert result.confidence == pytest.approx(0.75, abs=1e-6)
 
     # ------------------------------------------------------------------
     # B. Low-confidence local result — vision must be called
@@ -687,7 +820,7 @@ class TestRoadModelIntegration:
         road_result = RoadDamageResult(detected=False, category="", confidence=0.20)
         vision_calls = []
 
-        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address):
+        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address, *, road_model_hint=""):
             vision_calls.append(True)
             v = MagicMock()
             v.valid = True; v.category = "garbage"; v.category_confidence = 0.75
@@ -762,7 +895,7 @@ class TestRoadModelIntegration:
         _vr.severity = "medium"; _vr.severity_score = 0.5
         _vr.description = "d"; _vr.reason = "r"
 
-        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address):
+        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address, *, road_model_hint=""):
             vision_calls.append(True)
             return _vr
 
@@ -827,7 +960,7 @@ class TestRoadModelIntegration:
             m.all_class_names = ("person",)
             return m
 
-        async def _fake_vision(image_bytes, yolo_class, all_class_names, address):
+        async def _fake_vision(image_bytes, yolo_class, all_class_names, address, *, road_model_hint=""):
             return vision_result
 
         async def _fake_gen(cv_result, location, address):
@@ -872,16 +1005,24 @@ class TestRoadModelIntegration:
     # ------------------------------------------------------------------
 
     async def test_G_no_groq_key_local_road_model_still_works(self):
-        """G. With GROQ_API_KEY unset, local road model still classifies correctly."""
+        """G. With GROQ_API_KEY unset, pipeline still classifies correctly via heuristic fallback.
+
+        Under the new routing, civic_classify_image is still called but uses
+        the heuristic fallback when no API key is set.  The mocked
+        civic_classify_image returns a pothole result, confirming the pipeline
+        produces a valid result without crashing.
+        """
         from cv.road_damage import RoadDamageResult
         from schemas.report import IssueCategory
 
         road_result = RoadDamageResult(detected=True, category="pothole",
                                        confidence=0.78, raw_class="D40")
         vision_calls = []
+        hints_received = []
 
-        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address):
+        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address, *, road_model_hint=""):
             vision_calls.append(True)
+            hints_received.append(road_model_hint)
             v = MagicMock()
             v.valid = True; v.category = "pothole"; v.category_confidence = 0.9
             v.severity = "high"; v.severity_score = 0.85; v.description = "d"; v.reason = "r"
@@ -926,7 +1067,12 @@ class TestRoadModelIntegration:
                 os.environ["GROQ_API_KEY"] = saved_key
 
         assert result.category == IssueCategory.pothole
-        assert not vision_calls, "vision must be skipped when road model is confident"
+        # Under new routing, civic_classify_image is ALWAYS called (as hint to vision / heuristic)
+        assert vision_calls, "civic_classify_image must be called even when no GROQ key"
+        # The road model hint should be forwarded
+        assert hints_received and ("pothole" in hints_received[0].lower() or "d40" in hints_received[0].lower()), (
+            f"Road model hint should mention pothole/D40, got: {hints_received[0]!r}"
+        )
 
     # ------------------------------------------------------------------
     # H. Privacy — road model receives the redacted image
@@ -961,7 +1107,7 @@ class TestRoadModelIntegration:
             m.all_class_names = ()
             return m
 
-        async def _fake_vision(image_bytes, yolo_class, all_class_names, address):
+        async def _fake_vision(image_bytes, yolo_class, all_class_names, address, *, road_model_hint=""):
             v = MagicMock()
             v.valid = True; v.category = "road_damage"; v.category_confidence = 0.7
             v.severity = "medium"; v.severity_score = 0.5; v.description = "d"; v.reason = "r"
@@ -1012,7 +1158,7 @@ class TestRoadModelIntegration:
             call_order.append("road_model")
             return RoadDamageResult(detected=False, category="", confidence=0.0)
 
-        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address):
+        async def _tracking_vision(image_bytes, yolo_class, all_class_names, address, *, road_model_hint=""):
             call_order.append("civic_classify_image")
             v = MagicMock()
             v.valid = True; v.category = "garbage"; v.category_confidence = 0.75

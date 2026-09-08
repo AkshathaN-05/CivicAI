@@ -360,202 +360,182 @@ async def run_ai_pipeline(
     # -----------------------------------------------------------------------
     # Step 9: Classification + LLM (T2-10)
     #
-    # 9a. LOCAL ROAD-DAMAGE MODEL (new):
-    #     When YOLO confidence < 0.5 OR category is "other", try the local
-    #     RDD2022-trained road-damage model first.  This model specialises in
-    #     road surface classes (D00/D10/D20 → road_damage; D40 → pothole) and
-    #     is the correct tool for classifying pothole images that COCO YOLO
-    #     misclassifies as irrelevant objects (e.g. "frisbee").
-    #     If the local model is confident (≥ threshold), use its result and
-    #     SKIP the remote Groq vision call entirely.
+    # Routing (definitive post-fix):
     #
-    # 9b. CIVIC IMAGE CLASSIFICATION (vision-based):
-    #     Used when YOLO confidence < 0.5 OR category is "other" AND the local
-    #     road model is not confident (non-road civic images: drainage, sewage,
-    #     garbage, waterlogging, etc.).
-    #     Sends the actual redacted image to Groq vision (or heuristic fallback).
-    #     If result.valid=False → raise ImageValidationError (invalid/non-civic).
+    #   Step 9a: LOCAL ROAD-DAMAGE SPECIALIST MODEL (hint only)
+    #     Runs first for speed — it is CPU-only and cached.
+    #     Its result is passed as a HINT to Groq Vision, NOT used as the
+    #     final category.  This allows the specialist to say "I think this
+    #     is a pothole" while Groq Vision makes the authoritative call.
     #
-    # 9c. COMPLAINT DESCRIPTION:
+    #   Step 9b: GROQ VISION — ALWAYS the final semantic classifier
+    #     Receives the privacy-redacted image bytes + the road model hint.
+    #     Returns a structured civic classification using the 4-bucket schema:
+    #       pothole / road_damage / streetlight / water_sewage / other / invalid
+    #     Groq Vision is NEVER skipped for a valid candidate image.
+    #     The YOLO generic-object labels do NOT bypass Groq Vision.
+    #
+    #   Step 9c: COMPLAINT DESCRIPTION
     #     Always generates a description using the (possibly updated) category.
     # -----------------------------------------------------------------------
     description: str = ""
     llm_provider_used: str = "none"
-
-    # Determine if we need classification beyond the YOLO COCO result.
-    # Trigger condition: YOLO gave us no useful civic signal.
-    _needs_civic_classification = (
-        raw_detection_confidence < 0.5
-        or category == IssueCategory.other
-    )
 
     try:
         from services.llm_service import civic_classify_image, generate_complaint_description
         from llm.fallback_provider import map_vision_category_to_issue_category
 
         # -------------------------------------------------------------------
-        # Step 9a: Local road-damage model
+        # Step 9a: Local road-damage specialist model (hint only)
+        #
+        # Run unconditionally — it is fast (CPU, cached singleton).
+        # Its result is passed as a hint to Groq Vision; it does NOT
+        # short-circuit Groq.  This preserves road-model expertise while
+        # letting Groq Vision make the final semantic decision.
         # -------------------------------------------------------------------
-        _road_model_used = False
-        if _needs_civic_classification:
-            try:
-                from cv.road_damage import classify_road_damage
+        _road_model_hint: str = ""
+        try:
+            from cv.road_damage import classify_road_damage
 
-                # Privacy requirement: road model receives the redacted image,
-                # not the original validated (pre-redaction) bytes.
-                pil_for_road = Image.open(io.BytesIO(redacted_bytes))
-                road_result = classify_road_damage(pil_for_road)
-                del pil_for_road
-                gc.collect()
+            # Privacy requirement: road model receives the redacted image,
+            # not the original validated (pre-redaction) bytes.
+            pil_for_road = Image.open(io.BytesIO(redacted_bytes))
+            road_result = classify_road_damage(pil_for_road)
+            del pil_for_road
+            gc.collect()
 
-                if road_result.detected:
-                    # Local road model gave a confident road-damage result.
-                    # Accept it directly and skip the remote vision API.
-                    from llm.fallback_provider import map_vision_category_to_issue_category as _map
-                    new_category = _map(road_result.category)
-                    logger.info(
-                        "pipeline: step 9a (local road model) — %s (conf=%.2f, "
-                        "raw=%s) → category=%s",
-                        road_result.category,
-                        road_result.confidence,
-                        road_result.raw_class,
-                        new_category.value,
-                    )
-                    category = new_category
-                    confidence = road_result.confidence
-                    _road_model_used = True
-                    _needs_civic_classification = False  # skip remote vision
-                    llm_provider_used = "local_road_model"
-
-                    # Re-route authority for the road category.
-                    try:
-                        from services.authority_service import route_to_authority as _route
-                        auth_dict2, match_reason2, _ = _route(
-                            category.value, effective_address
-                        )
-                        if auth_dict2:
-                            authority_recommendation = auth_dict2.get(
-                                "short_name", authority_recommendation
-                            )
-                            authority_id = auth_dict2.get("id", authority_id)
-                            match_reason = match_reason2
-                    except Exception as exc2:
-                        logger.warning(
-                            "pipeline: step 9a (re-route authority after road model) "
-                            "failed: %s",
-                            exc2,
-                        )
-                else:
-                    logger.debug(
-                        "road_damage: no confident road detection (conf=%.3f) "
-                        "— proceeding to vision fallback",
-                        road_result.confidence,
-                    )
-            except Exception as exc_road:
-                logger.warning(
-                    "pipeline: step 9a (local road model) failed gracefully: %s",
-                    exc_road,
+            if road_result.detected:
+                # Build a NON-AUTHORITATIVE hint for Groq Vision.
+                # Explicitly labelled as secondary evidence that can be wrong
+                # (e.g. the road model may fire on the road surface visible
+                # underneath a garbage dump).  Groq Vision always makes the
+                # final semantic decision.
+                _road_model_hint = (
+                    f"[NON-AUTHORITATIVE secondary hint — road surface detector only] "
+                    f"road specialist detected: {road_result.category} "
+                    f"(conf={road_result.confidence:.2f}, raw class {road_result.raw_class}). "
+                    f"This hint reflects road SURFACE texture only. "
+                    f"If the primary civic problem is garbage, a streetlight, or water/sewage, "
+                    f"ignore this hint and classify by the actual civic issue."
                 )
-
-        if _needs_civic_classification:
-            # 9a: Vision-based civic classification
-            vision_result = await civic_classify_image(
-                image_bytes=redacted_bytes,
-                yolo_class=yolo_class,
-                all_class_names=all_class_names,
-                address=effective_address,
-            )
-
-            logger.debug(
-                "pipeline: step 9a (vision classify) — valid=%s category=%s conf=%.2f "
-                "severity=%s yolo_was='%s'",
-                vision_result.valid,
-                vision_result.category,
-                vision_result.category_confidence,
-                vision_result.severity,
-                yolo_class,
-            )
-
-            # If vision model says the image is NOT a civic issue, reject it.
-            if not vision_result.valid:
                 logger.info(
-                    "pipeline: step 9a (vision classify) — image rejected as non-civic: "
-                    "category=%s reason=%s",
-                    vision_result.category,
-                    vision_result.reason,
+                    "pipeline: step 9a (road model hint) — %s (conf=%.2f, raw=%s) "
+                    "→ passing as hint to Groq Vision",
+                    road_result.category,
+                    road_result.confidence,
+                    road_result.raw_class,
                 )
-                raise ImageValidationError(
-                    "This image does not appear to show a civic issue. "
-                    "Please upload a photo of a road, pothole, garbage, drainage, "
-                    "streetlight, water issue, or other public infrastructure problem. "
-                    f"({vision_result.reason})"
-                )
-
-            # Map vision category to canonical IssueCategory
-            new_category = map_vision_category_to_issue_category(vision_result.category)
-
-            # Use vision classification confidence as the new category confidence.
-            # This replaces the misleading "YOLO conf × weight" score that produced
-            # values like 4.4% for a pothole image (YOLO conf=0.11, weight=0.4).
-            new_confidence = vision_result.category_confidence
-
-            if new_category != category or abs(new_confidence - confidence) > 0.05:
-                logger.info(
-                    "pipeline: step 9a (vision classify) — updated: "
-                    "YOLO(%s/%.2f) → vision(%s/%.2f)",
-                    category.value, confidence,
-                    new_category.value, new_confidence,
-                )
-                category = new_category
-                confidence = new_confidence
-
-                # Use vision-generated description as primary description
-                # (specific to the image content, not a generic template).
-                if vision_result.description:
-                    description = vision_result.description
-
-                # Re-route authority for the updated category.
-                try:
-                    from services.authority_service import route_to_authority as _route
-                    auth_dict2, match_reason2, _ = _route(
-                        category.value, effective_address
-                    )
-                    if auth_dict2:
-                        authority_recommendation = auth_dict2.get("short_name", authority_recommendation)
-                        authority_id = auth_dict2.get("id", authority_id)
-                        match_reason = match_reason2
-                except Exception as exc2:
-                    logger.warning("pipeline: step 9a (re-route authority) failed: %s", exc2)
-
-            import os as _os
-            llm_provider_used = "groq_vision" if _os.environ.get("GROQ_API_KEY", "").strip() else "fallback"
-
-        elif not _road_model_used:
-            # High-confidence YOLO detection with a non-"other" category.
-            # Use existing LLM classify_category for refinement (original flow).
-            # Skipped when the local road model already produced a confident result.
-            from services.llm_service import classify_category
-            image_context = {
-                "detected_objects": yolo_class,
-                "address": effective_address,
-                "extra_context": f"confidence={raw_detection_confidence:.2f}",
-            }
-            llm_category = await classify_category(image_context)
-            if llm_category != category:
+            else:
                 logger.debug(
-                    "pipeline: step 9a (LLM classify) — YOLO=%s conf=%.2f → LLM=%s",
-                    category.value, raw_detection_confidence, llm_category.value,
+                    "pipeline: step 9a (road model) — no confident detection "
+                    "(conf=%.3f) — no hint provided",
+                    road_result.confidence,
                 )
-                category = llm_category
-                try:
-                    confidence = compute_confidence(raw_detection_confidence, category)
-                except Exception:
-                    pass
+        except Exception as exc_road:
+            logger.warning(
+                "pipeline: step 9a (local road model) failed gracefully: %s",
+                exc_road,
+            )
 
-            import os as _os
-            llm_provider_used = "groq" if _os.environ.get("GROQ_API_KEY", "").strip() else "fallback"
+        # -------------------------------------------------------------------
+        # Step 9b: Groq Vision — ALWAYS the final semantic classifier
+        #
+        # Called for every valid image.  Receives the privacy-redacted bytes
+        # and the road model hint (if available).
+        #
+        # Four semantic output categories:
+        #   pothole       → IssueCategory.pothole
+        #   road_damage   → IssueCategory.road_damage
+        #   streetlight   → IssueCategory.broken_streetlight
+        #   water_sewage  → IssueCategory.water_supply / .sewage / .waterlogging
+        #                   (resolved from the 'reason' subtype field)
+        #   other         → IssueCategory.other
+        #   invalid       → rejected (ImageValidationError)
+        # -------------------------------------------------------------------
+        vision_result = await civic_classify_image(
+            image_bytes=redacted_bytes,
+            yolo_class=yolo_class,
+            all_class_names=all_class_names,
+            address=effective_address,
+            road_model_hint=_road_model_hint,
+        )
 
-        # 9b: Generate complaint description (if not already set by vision result)
+        logger.debug(
+            "pipeline: step 9b (Groq Vision) — valid=%s category=%s conf=%.2f "
+            "severity=%s reason='%s' yolo_was='%s'",
+            vision_result.valid,
+            vision_result.category,
+            vision_result.category_confidence,
+            vision_result.severity,
+            vision_result.reason,
+            yolo_class,
+        )
+
+        # If vision model says the image is NOT a civic issue, reject it.
+        if not vision_result.valid:
+            logger.info(
+                "pipeline: step 9b (Groq Vision) — image rejected as non-civic: "
+                "category=%s reason=%s",
+                vision_result.category,
+                vision_result.reason,
+            )
+            raise ImageValidationError(
+                "This image does not appear to show a civic issue. "
+                "Please upload a photo of a road, pothole, streetlight, "
+                "water issue, or other public infrastructure problem. "
+                f"({vision_result.reason})"
+            )
+
+        # Map vision category to canonical IssueCategory.
+        # Pass reason so water_sewage can be resolved to the correct subtype.
+        new_category = map_vision_category_to_issue_category(
+            vision_result.category,
+            reason=vision_result.reason,
+        )
+
+        # Use vision classification confidence as the authoritative confidence.
+        new_confidence = vision_result.category_confidence
+
+        logger.info(
+            "pipeline: step 9b (Groq Vision) — "
+            "YOLO(%s/%.2f) road_hint=%r → vision(%s) → db_category=%s (conf=%.2f)",
+            category.value, confidence,
+            _road_model_hint or "none",
+            vision_result.category,
+            new_category.value, new_confidence,
+        )
+        category = new_category
+        confidence = new_confidence
+
+        # Use vision-generated description as primary description.
+        if vision_result.description:
+            description = vision_result.description
+
+        # Re-route authority for the vision-classified category.
+        try:
+            from services.authority_service import route_to_authority as _route
+            auth_dict2, match_reason2, _ = _route(
+                category.value, effective_address
+            )
+            if auth_dict2:
+                authority_recommendation = auth_dict2.get("short_name", authority_recommendation)
+                authority_id = auth_dict2.get("id", authority_id)
+                match_reason = match_reason2
+        except Exception as exc2:
+            logger.warning("pipeline: step 9b (re-route authority) failed: %s", exc2)
+
+        import os as _os
+        # Report the provider that actually ran.
+        # If the heuristic fallback was used (reason="heuristic_fallback"),
+        # report that accurately so callers know Groq Vision did not run.
+        if vision_result.reason == "heuristic_fallback":
+            llm_provider_used = "heuristic_fallback"
+        elif _os.environ.get("GROQ_API_KEY", "").strip():
+            llm_provider_used = "groq_vision"
+        else:
+            llm_provider_used = "fallback"
+
+        # 9c: Generate complaint description (if not already set by vision result)
         if not description:
             cv_result = {
                 "category": category,

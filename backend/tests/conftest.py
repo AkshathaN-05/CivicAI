@@ -1,4 +1,6 @@
-"""pytest conftest.py — shared fixtures for the CivicAI backend test suite.
+"""pytest configuration for the backend test suite.
+
+Fixtures defined here are available to all test modules automatically.
 
 Provides:
   reset_rate_limiter (autouse) — clears the slowapi in-memory rate-limit storage
@@ -6,6 +8,10 @@ Provides:
     Without this, the 10/minute AI rate limit is shared across all tests in the
     same pytest session and causes spurious 429 responses after the 10th test
     that hits POST /api/v1/reports/.
+
+  reset_groq_client_singletons (autouse) — resets the Groq AsyncGroq client
+    singletons before each test so tests that patch ``groq.AsyncGroq`` always
+    receive a fresh mock instance.
 """
 from __future__ import annotations
 
@@ -32,3 +38,30 @@ def reset_rate_limiter():
     except Exception:
         pass
     yield
+
+
+@pytest.fixture(autouse=True)
+def reset_groq_client_singletons():
+    """Reset Groq client singletons before each test.
+
+    Tests that patch ``llm.groq_provider.groq.AsyncGroq`` rely on the
+    mock constructor being called to return a fresh mock instance.  The
+    module-level client singletons introduced for production latency
+    optimisation would otherwise cache the mock instance from a previous
+    test, causing subsequent tests to use the wrong (stale) mock.
+
+    This fixture ensures every test starts with a clean slate for the
+    Groq client singletons.
+    """
+    try:
+        from llm.groq_provider import reset_groq_clients_for_testing
+        reset_groq_clients_for_testing()
+    except ImportError:
+        pass  # module not yet importable in some edge-case collection phases
+    yield
+    # Reset again after the test so the next test always starts clean
+    try:
+        from llm.groq_provider import reset_groq_clients_for_testing
+        reset_groq_clients_for_testing()
+    except ImportError:
+        pass

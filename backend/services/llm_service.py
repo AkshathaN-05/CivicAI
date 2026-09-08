@@ -267,8 +267,14 @@ async def civic_classify_image(
     yolo_class: str,
     all_class_names: tuple,
     address: str,
+    *,
+    road_model_hint: str = "",
 ) -> "CivicClassificationResult":
     """Classify a civic image using vision-based AI.
+
+    Groq Vision is ALWAYS the final semantic authority.  The road model hint
+    (if provided) is passed to Groq as supporting evidence but does NOT bypass
+    the Groq call.
 
     Primary path: Groq vision model (meta-llama/llama-4-scout-17b-16e-instruct)
     receives the actual image and returns a structured civic classification.
@@ -276,15 +282,13 @@ async def civic_classify_image(
     Fallback path: heuristic classification from YOLO class names + address
     keywords when Groq vision is unavailable.
 
-    The result's ``valid`` field indicates whether the image is a genuine
-    civic issue.  When ``valid=False`` (e.g. selfie, non-civic image), the
-    pipeline raises ImageValidationError.
-
     Args:
         image_bytes:     JPEG bytes of the validated/redacted image.
         yolo_class:      Top-1 YOLO class name (may be empty or irrelevant).
         all_class_names: All YOLO-detected class names (tuple, may be empty).
         address:         Human-readable address/location string.
+        road_model_hint: Optional hint string from the road-damage specialist
+                         model (e.g. "pothole (conf=0.82, raw D40)").
 
     Returns:
         :class:`~llm.groq_provider.CivicClassificationResult`.
@@ -293,7 +297,11 @@ async def civic_classify_image(
 
     if _groq_available():
         try:
-            result = await _groq_classify(image_bytes, address)
+            result = await _groq_classify(
+                image_bytes,
+                address,
+                road_model_hint=road_model_hint,
+            )
             logger.info(
                 "llm_service.civic_classify_image: provider=groq_vision "
                 "valid=%s category=%s conf=%.2f",
