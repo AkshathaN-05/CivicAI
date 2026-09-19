@@ -17,8 +17,10 @@ Public API:
     ) -> CivicClassificationResult
 
 Design decisions (LOCKED — Part A §9):
-- Text model: ``llama-3.1-8b-instant`` on Groq API.
-- Vision model: ``meta-llama/llama-4-scout-17b-16e-instruct`` on Groq API.
+- Text model: ``openai/gpt-oss-20b`` on Groq API.
+  (llama-3.1-8b-instant was removed from Groq on 2025-07-21 — returns HTTP 404;
+   openai/gpt-oss-20b is the confirmed available lightweight replacement.)
+- Vision model: ``qwen/qwen3.8-27b`` on Groq API.
 - Output is expected as JSON embedded in the model's text response.
 - Every response is validated with :func:`~llm.output_validator.validate_output`.
 - Any error (network, timeout, bad JSON, schema violation) raises
@@ -54,7 +56,11 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # LOCKED: model identifiers (Part A §9)
 # ---------------------------------------------------------------------------
-GROQ_MODEL: str = "llama-3.1-8b-instant"
+# llama-3.1-8b-instant was removed from Groq (HTTP 404 as of 2025-07-21).
+# openai/gpt-oss-20b is the confirmed available lightweight text replacement
+# on this Groq account — verified callable, JSON-capable, and compatible with
+# the existing COMPLAINT_DESCRIPTION_PROMPT / RTI_DRAFT_PROMPT / CATEGORY_CLASSIFICATION_PROMPT.
+GROQ_MODEL: str = "openai/gpt-oss-20b"
 # Vision model — supports image input via base64 URL.
 # qwen/qwen3.8-27b is the current Groq-hosted vision model that accepts
 # image_url content blocks.  meta-llama/llama-4-scout-17b-16e-instruct
@@ -121,19 +127,33 @@ _THINK_BLOCK_RE: re.Pattern[str] = re.compile(
     r"<think>.*?</think>", re.DOTALL | re.IGNORECASE
 )
 
+# Matches an UN-CLOSED <think> block — produced when max_tokens truncates the
+# response mid-reasoning so the closing </think> tag is never emitted.
+# Strips everything from <think> to end-of-string to prevent treating
+# reasoning fragments as the final JSON answer.
+_THINK_UNCLOSED_RE: re.Pattern[str] = re.compile(
+    r"<think>.*$", re.DOTALL | re.IGNORECASE
+)
+
 
 def _extract_json(text: str) -> dict:
     """Extract the final JSON answer object from *text*.
 
-    Handles three output shapes produced by Groq-hosted models:
+    Handles four output shapes produced by Groq-hosted models:
     1. Bare JSON:  ``{"valid": true, "category": ...}``
     2. Fenced JSON: ````json\\n{"valid": ...}\\n````
-    3. Think+JSON (qwen reasoning models):
+    3. Think+JSON (qwen reasoning models, normal):
        ``<think>...reasoning...</think>\\n{"valid": ...}``
+    4. Truncated think block (qwen, max_tokens cut off before </think>):
+       ``<think>...truncated reasoning...``  — no closing tag, no JSON after.
+       After stripping the unclosed block, falls through to bare extraction
+       on whatever text preceded the <think> open tag (typically empty for
+       pure reasoning models, raising LLMOutputInvalid as expected).
 
     Strategy:
-    - Strip any ``<think>...</think>`` blocks first to avoid extracting a
-      JSON-like fragment from the model's reasoning chain.
+    - Strip any closed ``<think>...</think>`` blocks first to avoid extracting
+      a JSON-like fragment from the model's reasoning chain.
+    - Strip any remaining unclosed ``<think>...`` block (truncated output).
     - Try a fenced code block next.
     - Fall back to the LAST valid ``{...}`` block in the remaining text.
       Using the *last* match is important: the reasoning model's preamble
@@ -150,8 +170,10 @@ def _extract_json(text: str) -> dict:
         :class:`~llm.output_validator.LLMOutputInvalid`: If no valid JSON
             object is found or JSON parsing fails.
     """
-    # Step 1: strip any chain-of-thought thinking blocks
+    # Step 1a: strip closed <think>...</think> blocks
     clean_text = _THINK_BLOCK_RE.sub("", text).strip()
+    # Step 1b: strip any remaining unclosed <think>... block (truncated output)
+    clean_text = _THINK_UNCLOSED_RE.sub("", clean_text).strip()
 
     # Step 2: try fenced block first (``` json ... ```)
     match = _JSON_BLOCK_RE.search(clean_text)
@@ -202,6 +224,10 @@ class CivicClassificationResult:
         description:         Specific, evidence-based description of what is
                              visible in the image.
         reason:              Brief reason for the validity decision.
+        primary_issue:       Short factual description of the actual civic
+                             problem visible (e.g. "large garbage pile on
+                             roadside").  Used for internal evidence validation
+                             to catch category/description mismatches.
     """
     valid: bool
     category: str
@@ -210,6 +236,7 @@ class CivicClassificationResult:
     severity_score: float
     description: str
     reason: str
+    primary_issue: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -518,10 +545,123 @@ def _parse_civic_classification(raw: dict) -> CivicClassificationResult:
 
         description = str(raw.get("description", ""))[:500]
         reason = str(raw.get("reason", ""))[:200]
+        primary_issue = str(raw.get("primary_issue", ""))[:300]
     except (TypeError, ValueError) as exc:
         raise LLMOutputInvalid(
             f"CivicClassificationResult parse error: {exc}"
         ) from exc
+
+    # ------------------------------------------------------------------
+    # Evidence mismatch guard: if the model's own primary_issue text
+    # strongly implies a different category than what it returned, correct
+    # the classification.
+    #
+    # Two modes:
+    #   1. road_damage mismatch: model said road_damage but primary_issue
+    #      describes garbage/water/drain/streetlight/construction → override.
+    #   2. other rescue: model returned 'other' but primary_issue clearly
+    #      describes a specific civic category → upgrade to that category.
+    #
+    # Only fires when primary_issue is non-empty (new schema).
+    # 'invalid' is never touched — it is always authoritative.
+    # ------------------------------------------------------------------
+    if primary_issue and category != "invalid":
+        pi_lower = primary_issue.lower()
+
+        # Keywords that indicate a road-damage override is wrong
+        _GARBAGE_WORDS = (
+            "garbage", "waste", "litter", "trash", "rubbish", "dump",
+            "bin", "debris", "solid waste", "refuse",
+        )
+        _WATER_WORDS = (
+            "water", "flood", "waterlog", "sewage", "drain overflow",
+            "stagnant", "standing water", "leaking pipe", "burst pipe",
+            "wastewater", "effluent",
+        )
+        _DRAIN_WORDS = (
+            "open drain", "uncovered drain", "drain channel", "gutter",
+            "storm drain", "missing cover", "drain cover",
+        )
+        _STREETLIGHT_WORDS = (
+            "streetlight", "street light", "lamp post", "lamp", "light pole",
+            "broken light", "fallen pole",
+        )
+        _CONSTRUCTION_WORDS = (
+            "construction", "encroachment", "encroaching", "unauthorized",
+            "illegal structure", "building site",
+        )
+
+        def _matches_any(text: str, words: tuple) -> bool:
+            return any(w in text for w in words)
+
+        # If model said road_damage but primary_issue sounds like something else
+        if category == "road_damage":
+            if _matches_any(pi_lower, _GARBAGE_WORDS):
+                logger.info(
+                    "_parse_civic_classification: evidence mismatch — "
+                    "category=road_damage but primary_issue='%s' → overriding to garbage_overflow",
+                    primary_issue[:100],
+                )
+                category = "garbage_overflow"
+            elif _matches_any(pi_lower, _DRAIN_WORDS):
+                logger.info(
+                    "_parse_civic_classification: evidence mismatch — "
+                    "category=road_damage but primary_issue='%s' → overriding to open_drain",
+                    primary_issue[:100],
+                )
+                category = "open_drain"
+            elif _matches_any(pi_lower, _STREETLIGHT_WORDS):
+                logger.info(
+                    "_parse_civic_classification: evidence mismatch — "
+                    "category=road_damage but primary_issue='%s' → overriding to broken_streetlight",
+                    primary_issue[:100],
+                )
+                category = "broken_streetlight"
+            elif _matches_any(pi_lower, _CONSTRUCTION_WORDS):
+                logger.info(
+                    "_parse_civic_classification: evidence mismatch — "
+                    "category=road_damage but primary_issue='%s' → overriding to illegal_construction",
+                    primary_issue[:100],
+                )
+                category = "illegal_construction"
+            elif _matches_any(pi_lower, _WATER_WORDS):
+                logger.info(
+                    "_parse_civic_classification: evidence mismatch — "
+                    "category=road_damage but primary_issue='%s' → overriding to water_sewage",
+                    primary_issue[:100],
+                )
+                category = "water_sewage"
+
+        # If model said "other" but primary_issue strongly implies a specific category
+        elif category == "other":
+            if _matches_any(pi_lower, _GARBAGE_WORDS):
+                logger.info(
+                    "_parse_civic_classification: evidence rescue — "
+                    "category=other but primary_issue='%s' → upgrading to garbage_overflow",
+                    primary_issue[:100],
+                )
+                category = "garbage_overflow"
+            elif _matches_any(pi_lower, _DRAIN_WORDS):
+                logger.info(
+                    "_parse_civic_classification: evidence rescue — "
+                    "category=other but primary_issue='%s' → upgrading to open_drain",
+                    primary_issue[:100],
+                )
+                category = "open_drain"
+            elif _matches_any(pi_lower, _STREETLIGHT_WORDS):
+                logger.info(
+                    "_parse_civic_classification: evidence rescue — "
+                    "category=other but primary_issue='%s' → upgrading to broken_streetlight",
+                    primary_issue[:100],
+                )
+                category = "broken_streetlight"
+            elif _matches_any(pi_lower, _WATER_WORDS):
+                logger.info(
+                    "_parse_civic_classification: evidence rescue — "
+                    "category=other but primary_issue='%s' → upgrading to water_sewage",
+                    primary_issue[:100],
+                )
+                category = "water_sewage"
 
     return CivicClassificationResult(
         valid=valid,
@@ -531,6 +671,7 @@ def _parse_civic_classification(raw: dict) -> CivicClassificationResult:
         severity_score=sev_score,
         description=description,
         reason=reason,
+        primary_issue=primary_issue,
     )
 
 
@@ -657,12 +798,12 @@ async def civic_classify_image(
     safe_address = sanitize_for_prompt(address or "")
     safe_hint = sanitize_for_prompt(road_model_hint or "")
 
-    # Resize the already-redacted image for Groq Vision upload to reduce latency.
-    # A 640px max dimension preserves enough detail for civic classification while
-    # significantly reducing base64 payload size.  Aspect ratio is preserved.
-    # Privacy redaction and road-model inference always use the full-resolution bytes;
-    # only this Groq Vision upload path uses the downsized copy.
-    _GROQ_VISION_MAX_PX: int = 640
+    # Resize the already-redacted image for Groq Vision upload.
+    # 1024px gives the model enough resolution to distinguish garbage/water/drain
+    # details from road-surface context.  Privacy redaction and road-model inference
+    # always use the full-resolution bytes; only this Groq Vision upload path uses
+    # the downsized copy.
+    _GROQ_VISION_MAX_PX: int = 1024
     try:
         import io as _io
         from PIL import Image as _Image
@@ -699,6 +840,39 @@ async def civic_classify_image(
         road_model_hint=safe_hint if safe_hint else "none",
     )
 
+    # Strict JSON Schema for structured output.
+    # Every property must appear in "required" and additionalProperties=False
+    # for Groq strict=True mode (confirmed working in live API test).
+    _VISION_RESPONSE_SCHEMA = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "civic_classification",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "valid":          {"type": "boolean"},
+                    "category":       {"type": "string"},
+                    "confidence":     {"type": "number"},
+                    "severity":       {"type": "number"},
+                    "primary_issue":  {"type": "string"},
+                    "description":    {"type": "string"},
+                    "reason":         {"type": "string"},
+                },
+                "required": [
+                    "valid",
+                    "category",
+                    "confidence",
+                    "severity",
+                    "primary_issue",
+                    "description",
+                    "reason",
+                ],
+                "additionalProperties": False,
+            },
+        },
+    }
+
     try:
         client = _get_groq_vision_client(resolved_key, timeout)
         response = await client.chat.completions.create(
@@ -718,8 +892,11 @@ async def civic_classify_image(
                     ],
                 }
             ],
-            temperature=0.1,  # very low temperature for deterministic classification
-            max_tokens=512,
+            temperature=0.1,       # low temperature for deterministic classification
+            max_tokens=2048,       # budget for reasoning chain + final JSON answer
+            reasoning_format="hidden",   # suppress <think> tokens in message.content
+            reasoning_effort="high",     # maximise reasoning depth for accuracy
+            response_format=_VISION_RESPONSE_SCHEMA,  # enforce strict JSON schema
         )
     except groq.GroqError as exc:
         logger.warning("Groq vision API error: %s", exc)
@@ -729,7 +906,27 @@ async def civic_classify_image(
         raise LLMOutputInvalid(f"Groq vision call failed: {exc}") from exc
 
     try:
-        content: str = response.choices[0].message.content or ""
+        msg = response.choices[0].message
+        content: str = msg.content or ""
+        # qwen3.8-27b (and other reasoning models) may route chain-of-thought
+        # output to a separate 'thinking' or 'reasoning_content' field on the
+        # message object when the Groq API is configured with a thinking budget.
+        # In that case message.content can be empty while the actual answer
+        # (or the full think+answer text) lives in the auxiliary field.
+        # We check both known field names defensively without assuming either
+        # exists on the SDK response object.
+        if not content.strip():
+            for _thinking_attr in ("thinking", "reasoning_content"):
+                _thinking_val = getattr(msg, _thinking_attr, None)
+                if _thinking_val and isinstance(_thinking_val, str) and _thinking_val.strip():
+                    content = _thinking_val
+                    logger.debug(
+                        "groq_provider: content was empty; using message.%s "
+                        "(%d chars) for JSON extraction",
+                        _thinking_attr,
+                        len(content),
+                    )
+                    break
     except (AttributeError, IndexError) as exc:
         raise LLMOutputInvalid(
             f"Unexpected Groq vision response structure: {exc}"
