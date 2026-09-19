@@ -484,7 +484,11 @@ class TestCallGroq:
         assert isinstance(result, LLMOutput)
 
     async def test_uses_locked_model_name(self):
-        """The provider always uses the locked model llama-3.1-8b-instant."""
+        """The provider uses the configured text model (openai/gpt-oss-20b).
+
+        llama-3.1-8b-instant was removed from Groq (HTTP 404) and replaced
+        with openai/gpt-oss-20b — the confirmed available lightweight model.
+        """
         from llm.groq_provider import GROQ_MODEL
 
-        assert GROQ_MODEL == "llama-3.1-8b-instant"
+        assert GROQ_MODEL == "openai/gpt-oss-20b"
